@@ -49,7 +49,6 @@ def parse_args() -> argparse.Namespace:
         choices=("validation", "test"),
         default="test",
     )
-    parser.add_argument("--input-max-length", type=int, required=True)
     parser.add_argument("--max-new-tokens", type=int, default=128)
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument(
@@ -81,8 +80,6 @@ def validate_args(args: argparse.Namespace) -> None:
         raise FileNotFoundError(f"Model directory not found: {args.model_path}")
     if not args.data_dir.is_dir():
         raise FileNotFoundError(f"Data directory not found: {args.data_dir}")
-    if args.input_max_length <= 0:
-        raise ValueError("--input-max-length must be positive")
     if args.max_new_tokens <= 0:
         raise ValueError("--max-new-tokens must be positive")
     if args.batch_size <= 0:
@@ -191,7 +188,6 @@ def main() -> None:
     print("Split:", args.split, flush=True)
     print(f"Range: [{start_index}, {end_index})", flush=True)
     print(f"Samples: {selected_count} / {total_count}", flush=True)
-    print("Input max length:", args.input_max_length, flush=True)
     print("Batch size:", args.batch_size, flush=True)
     print("Device:", device, flush=True)
     print("Dtype:", model_dtype, flush=True)
@@ -217,8 +213,7 @@ def main() -> None:
         targets = [target.strip() for _, target in examples]
         encoded = tokenizer(
             [args.prefix + source for source in sources],
-            max_length=args.input_max_length,
-            truncation=True,
+            truncation=False,
             padding=True,
             return_tensors="pt",
         )
@@ -285,7 +280,6 @@ def main() -> None:
         "samples": processed,
         "matches": matches,
         "exact_match": matches / processed,
-        "input_max_length": args.input_max_length,
         "max_new_tokens": args.max_new_tokens,
         "batch_size": args.batch_size,
         "elapsed_seconds": elapsed_seconds,

@@ -1,7 +1,7 @@
 #!/bin/bash
 
 #SBATCH --output=logs/%x_%j.out
-#SBATCH --job-name=flan_t5_small_1536
+#SBATCH --job-name=flan_t5_xxl_1x16_10ep
 #SBATCH --partition=workq
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
@@ -23,42 +23,32 @@ cd "$SLURM_SUBMIT_DIR"
 
 # ===== Experiment configuration =====
 
-export MODEL_NAME="google/flan-t5-small"
-export INPUT_MAX_LENGTH=1536
+export MODEL_NAME="google/flan-t5-xxl"
 export TARGET_MAX_LENGTH=128
 
-export TRAIN_BATCH_SIZE=4
-export GRAD_ACCUMULATION_STEPS=4
+export TRAIN_BATCH_SIZE=1
+export GRAD_ACCUMULATION_STEPS=16
 
 # 4 × 4 × 1 GPU = effective batch size 16.
-export EVAL_BATCH_SIZE=8
-export GENERATION_BATCH_SIZE=8
+export EVAL_BATCH_SIZE=4
+export GENERATION_BATCH_SIZE=4
 
 export LEARNING_RATE="5e-5"
 export WEIGHT_DECAY="0.01"
-export NUM_EPOCHS=3
+export NUM_EPOCHS=10
 export SEED=42
 
 export SAVE_STEPS=2000
 export SAVE_TOTAL_LIMIT=2
 
 # Start with gradient checkpointing disabled.
-export GRADIENT_CHECKPOINTING=0
+export GRADIENT_CHECKPOINTING=1
 
 export TEST_SAMPLE_SIZE=1000
 export GENERATION_MAX_NEW_TOKENS=128
 
 # Explicit output directory prevents accidental checkpoint reuse.
-export OUTPUT_DIR="$SLURM_SUBMIT_DIR/outputs/flan-t5-large_nmr_input1536_bs16"
-
-export MASTER_ADDR=$(scontrol show hostnames $SLURM_NODELIST | head -n 1)
-export MASTER_PORT=29600
-export WORLD_SIZE=$SLURM_NTASKS
-
-echo "MASTER_ADDR=$MASTER_ADDR"
-echo "WORLD_SIZE=$WORLD_SIZE"
-
-
+export OUTPUT_DIR="$SLURM_SUBMIT_DIR/outputs/flan-t5-xxl_nmr_input1536_1x16_ep10"
 
 
 # ===== Slurm information =====
@@ -97,7 +87,6 @@ nvidia-smi
 
 echo "===== Shell Training Configuration ====="
 echo "Model: $MODEL_NAME"
-echo "Input max length: $INPUT_MAX_LENGTH"
 echo "Train batch size per device: $TRAIN_BATCH_SIZE"
 echo "Gradient accumulation steps: $GRAD_ACCUMULATION_STEPS"
 echo "Effective batch size: $((TRAIN_BATCH_SIZE * GRAD_ACCUMULATION_STEPS))"
@@ -112,10 +101,7 @@ echo "Output directory: $OUTPUT_DIR"
 
 echo "===== Start Training ====="
 
-srun --cpu-bind=none bash -c '
-export RANK=$SLURM_PROCID
-export LOCAL_RANK=$SLURM_LOCALID
-python -u t5_train.py
+srun python -u t5_train.py
 
 echo "===== Job Finished Successfully ====="
 echo "End time: $(date)"

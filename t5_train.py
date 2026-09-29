@@ -26,10 +26,6 @@ MODEL_NAME = os.environ.get(
     "google/flan-t5-base",
 )
 
-INPUT_MAX_LENGTH = int(
-    os.environ.get("INPUT_MAX_LENGTH", "1024")
-)
-
 TARGET_MAX_LENGTH = int(
     os.environ.get("TARGET_MAX_LENGTH", "128")
 )
@@ -44,11 +40,11 @@ DATA_DIR = Path(
 # Convert google/flan-t5-base into flan-t5-base.
 MODEL_SHORT_NAME = MODEL_NAME.split("/")[-1]
 
-# Each model/length combination receives an independent folder.
+# Each model receives an independent folder.
 DEFAULT_OUTPUT_DIR = (
     BASE_DIR
     / "outputs"
-    / f"{MODEL_SHORT_NAME}_nmr_input{INPUT_MAX_LENGTH}"
+    / f"{MODEL_SHORT_NAME}_nmr"
 )
 
 OUTPUT_DIR = Path(
@@ -223,7 +219,6 @@ def print_configuration(
     print("Validation rows:", len(dataset["validation"]))
     print("Test rows:", len(dataset["test"]))
 
-    print("Input max length:", INPUT_MAX_LENGTH)
     print("Target max length:", TARGET_MAX_LENGTH)
 
     print("Learning rate:", LEARNING_RATE)
@@ -272,63 +267,6 @@ def print_configuration(
     print("Random seed:", SEED)
     print("====================================")
 
-def report_length_statistics(
-    dataset: Dataset,
-    tokenizer,
-    sample_size: int = 10000,
-    batch_size: int = 256,
-) -> None:
-    """Report input token lengths before truncation."""
-
-    sample_size = min(sample_size, len(dataset))
-
-    # Sample with a fixed seed so every experiment measures the same examples.
-    sample = (
-        dataset.shuffle(seed=SEED)
-        .select(range(sample_size))
-    )
-
-    lengths = []
-
-    for start in range(0, sample_size, batch_size):
-        end = min(start + batch_size, sample_size)
-        sources = sample[start:end]["src"]
-
-        encoded = tokenizer(
-            [PREFIX + source for source in sources],
-            truncation=False,
-            padding=False,
-            add_special_tokens=True,
-        )
-
-        lengths.extend(
-            len(input_ids)
-            for input_ids in encoded["input_ids"]
-        )
-
-    lengths = np.asarray(lengths)
-
-    print("===== Input Length Statistics =====")
-    print("Samples:", len(lengths))
-    print("Mean:", float(np.mean(lengths)))
-    print("Median:", float(np.median(lengths)))
-    print("P90:", float(np.percentile(lengths, 90)))
-    print("P95:", float(np.percentile(lengths, 95)))
-    print("P99:", float(np.percentile(lengths, 99)))
-    print("Maximum:", int(np.max(lengths)))
-
-    for limit in (256, 512, 1024, 1536):
-        print(
-            f"Over {limit}:",
-            f"{np.mean(lengths > limit):.2%}",
-        )
-
-    print(
-        f"Over configured limit ({INPUT_MAX_LENGTH}):",
-        f"{np.mean(lengths > INPUT_MAX_LENGTH):.2%}",
-    )
-
-
 def generate_test_metrics(model, tokenizer, test_dataset: Dataset) -> dict[str, float]:
     """Generate a bounded test subset and report exact string-match accuracy."""
     sample_count = min(TEST_SAMPLE_SIZE, len(test_dataset))
@@ -341,8 +279,7 @@ def generate_test_metrics(model, tokenizer, test_dataset: Dataset) -> dict[str, 
         inputs = [PREFIX + example["src"] for example in examples]
         encoded = tokenizer(
             inputs,
-            max_length=INPUT_MAX_LENGTH,
-            truncation=True,
+            truncation=False,
             padding=True,
             return_tensors="pt",
         )
@@ -402,16 +339,10 @@ def main() -> None:
         local_files_only=local_files_only,
     )
 
-    report_length_statistics(
-        dataset["train"],
-        tokenizer,
-    )
-
     def preprocess(examples):
         model_inputs = tokenizer(
             [PREFIX + source for source in examples["src"]],
-            max_length=INPUT_MAX_LENGTH,
-            truncation=True,
+            truncation=False,
         )
         labels = tokenizer(
             text_target=examples["tgt"],

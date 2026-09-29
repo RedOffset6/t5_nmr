@@ -1,7 +1,7 @@
 #!/bin/bash
 
 #SBATCH --output=logs/%x_%j.out
-#SBATCH --job-name=flan_t5_xl_1536_3ep
+#SBATCH --job-name=flan_t5_small_4x4_3ep
 #SBATCH --partition=workq
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
@@ -23,8 +23,7 @@ cd "$SLURM_SUBMIT_DIR"
 
 # ===== Experiment configuration =====
 
-export MODEL_NAME="google/flan-t5-xl"
-export INPUT_MAX_LENGTH=1536
+export MODEL_NAME="google/flan-t5-small"
 export TARGET_MAX_LENGTH=128
 
 export TRAIN_BATCH_SIZE=4
@@ -43,13 +42,23 @@ export SAVE_STEPS=2000
 export SAVE_TOTAL_LIMIT=2
 
 # Start with gradient checkpointing disabled.
-export GRADIENT_CHECKPOINTING=1
+export GRADIENT_CHECKPOINTING=0
 
 export TEST_SAMPLE_SIZE=1000
 export GENERATION_MAX_NEW_TOKENS=128
 
 # Explicit output directory prevents accidental checkpoint reuse.
-export OUTPUT_DIR="$SLURM_SUBMIT_DIR/outputs/flan-t5-xl_nmr_input1536_bs4x4_3ep"
+export OUTPUT_DIR="$SLURM_SUBMIT_DIR/outputs/flan-t5-small_nmr_input1536_4x4_3ep"
+
+export MASTER_ADDR=$(scontrol show hostnames $SLURM_NODELIST | head -n 1)
+export MASTER_PORT=29600
+export WORLD_SIZE=$SLURM_NTASKS
+
+echo "MASTER_ADDR=$MASTER_ADDR"
+echo "WORLD_SIZE=$WORLD_SIZE"
+
+
+
 
 # ===== Slurm information =====
 
@@ -87,7 +96,6 @@ nvidia-smi
 
 echo "===== Shell Training Configuration ====="
 echo "Model: $MODEL_NAME"
-echo "Input max length: $INPUT_MAX_LENGTH"
 echo "Train batch size per device: $TRAIN_BATCH_SIZE"
 echo "Gradient accumulation steps: $GRAD_ACCUMULATION_STEPS"
 echo "Effective batch size: $((TRAIN_BATCH_SIZE * GRAD_ACCUMULATION_STEPS))"
@@ -102,7 +110,10 @@ echo "Output directory: $OUTPUT_DIR"
 
 echo "===== Start Training ====="
 
-srun python -u t5_train.py
+srun --cpu-bind=none bash -c '
+export RANK=$SLURM_PROCID
+export LOCAL_RANK=$SLURM_LOCALID
+python -u t5_train.py
 
 echo "===== Job Finished Successfully ====="
 echo "End time: $(date)"

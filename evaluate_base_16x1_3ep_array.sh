@@ -1,6 +1,6 @@
 #!/bin/bash
 
-#SBATCH --job-name=eval_xl_1024_3ep
+#SBATCH --job-name=eval_base_16x1_3ep
 #SBATCH --output=logs/%x_%A_%a.out
 #SBATCH --partition=workq
 #SBATCH --nodes=1
@@ -27,10 +27,9 @@ echo "Start index: $START_INDEX"
 echo "Chunk size: $CHUNK_SIZE"
 
 python evaluate_exact_match.py \
-  --model-path outputs/flan-t5-xl_nmr_input1024_bs4x4_3ep/final_model \
+  --model-path outputs/flan-t5-base_nmr_input1536_16x1_3ep/final_model \
   --data-dir alberts_2d \
   --split test \
-  --input-max-length 1024 \
   --batch-size 2 \
   --start-index "$START_INDEX" \
   --sample-size "$CHUNK_SIZE" \
