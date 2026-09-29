@@ -26,9 +26,6 @@ MODEL_NAME = os.environ.get(
     "google/flan-t5-base",
 )
 
-# Longer inputs are truncated; evaluate_exact_match.py uses the same value.
-INPUT_MAX_LENGTH = 1536
-
 TARGET_MAX_LENGTH = int(
     os.environ.get("TARGET_MAX_LENGTH", "128")
 )
@@ -222,7 +219,6 @@ def print_configuration(
     print("Validation rows:", len(dataset["validation"]))
     print("Test rows:", len(dataset["test"]))
 
-    print("Input max length:", INPUT_MAX_LENGTH)
     print("Target max length:", TARGET_MAX_LENGTH)
 
     print("Learning rate:", LEARNING_RATE)
@@ -283,8 +279,7 @@ def generate_test_metrics(model, tokenizer, test_dataset: Dataset) -> dict[str, 
         inputs = [PREFIX + example["src"] for example in examples]
         encoded = tokenizer(
             inputs,
-            max_length=INPUT_MAX_LENGTH,
-            truncation=True,
+            truncation=False,
             padding=True,
             return_tensors="pt",
         )
@@ -347,8 +342,7 @@ def main() -> None:
     def preprocess(examples):
         model_inputs = tokenizer(
             [PREFIX + source for source in examples["src"]],
-            max_length=INPUT_MAX_LENGTH,
-            truncation=True,
+            truncation=False,
         )
         labels = tokenizer(
             text_target=examples["tgt"],

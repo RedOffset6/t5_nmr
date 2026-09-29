@@ -14,8 +14,6 @@ from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_PREFIX = "predict SMILES from NMR spectrum: "
-# Must match INPUT_MAX_LENGTH in t5_train.py.
-INPUT_MAX_LENGTH = 1536
 
 
 class TextPairDataset(Dataset):
@@ -190,7 +188,6 @@ def main() -> None:
     print("Split:", args.split, flush=True)
     print(f"Range: [{start_index}, {end_index})", flush=True)
     print(f"Samples: {selected_count} / {total_count}", flush=True)
-    print("Input max length:", INPUT_MAX_LENGTH, flush=True)
     print("Batch size:", args.batch_size, flush=True)
     print("Device:", device, flush=True)
     print("Dtype:", model_dtype, flush=True)
@@ -216,8 +213,7 @@ def main() -> None:
         targets = [target.strip() for _, target in examples]
         encoded = tokenizer(
             [args.prefix + source for source in sources],
-            max_length=INPUT_MAX_LENGTH,
-            truncation=True,
+            truncation=False,
             padding=True,
             return_tensors="pt",
         )
@@ -284,7 +280,6 @@ def main() -> None:
         "samples": processed,
         "matches": matches,
         "exact_match": matches / processed,
-        "input_max_length": INPUT_MAX_LENGTH,
         "max_new_tokens": args.max_new_tokens,
         "batch_size": args.batch_size,
         "elapsed_seconds": elapsed_seconds,

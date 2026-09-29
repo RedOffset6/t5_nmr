@@ -5,7 +5,7 @@ This repository contains training and evaluation code for predicting molecular S
 ## Repository contents
 
 - `t5_train.py`: shared training pipeline.
-- `start_training_<model>_<batch>x<accumulation>_<epochs>.sh`: Slurm configurations for different model sizes, batch sizes, and epoch counts. Inputs are truncated to 1,536 tokens.
+- `start_training_<model>_<batch>x<accumulation>_<epochs>.sh`: Slurm configurations for different model sizes, batch sizes, and epoch counts. Inputs are never truncated.
 - `evaluate_exact_match.py`: exact-match evaluation program.
 - `evaluate_<model>_<batch>x<accumulation>_<epochs>_array.sh`: Slurm array jobs that evaluate the matching training run.
 - `evaluate_check.sh`: 10-sample evaluation smoke test.
