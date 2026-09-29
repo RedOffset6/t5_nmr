@@ -47,21 +47,27 @@ Optionally, check that a GPU node works before using hours of GPU time:
 
     sbatch test_gpu.sh
 
+Before the first multi-GPU run, check that all 4 GPUs of a node can communicate (see [Multi-GPU training](#multi-gpu-training)):
+
+    sbatch test_multi_gpu.sh
+
 ### 2. Train a model
 
 Pick a training script and submit it:
 
-    sbatch start_training_xl_4x4_10ep.sh
+    sbatch start_training_xl_4x1x4_10ep.sh
 
 The job:
 
 1. Downloads the pretrained FLAN-T5 model from Hugging Face. The first run needs internet access.
-2. Fine-tunes it on `alberts_2d/` training data, measuring validation loss after each epoch.
+2. Tokenizes the data once and caches it in `outputs/<run>/tokenized/`, so a resubmitted job starts faster. Then it fine-tunes the model on `alberts_2d/` training data, measuring validation loss after each epoch. Scripts with a GPU count in their name train on all 4 GPUs of a node, or on 8 GPUs across two nodes.
 3. Saves a checkpoint every 2,000 steps to `outputs/<run>/checkpoint-*`, keeping the latest two.
 4. Saves the finished model to `outputs/<run>/final_model`.
 5. Scores exact match on the first 1,000 test molecules as a quick check, saved to `outputs/<run>/test_results.json`. This is not the official score; that comes from step 3.
 
-**Long runs:** each job has a one-day time limit. If a job runs out of time, submit the same script again. It resumes from the latest checkpoint in its output folder.
+**Long runs:** each job has a one-day time limit. If a job runs out of time, submit the same script again. It resumes from the latest checkpoint in its output folder. A multi-GPU run can only resume on the same number of GPUs, with the same `PARALLEL_MODE`, as the job that wrote the checkpoint, so don't edit the script's resources between resubmissions.
+
+**Smoke test:** to test a configuration end to end before a long run, submit it with `MAX_STEPS` set, for example `sbatch --export=ALL,MAX_STEPS=50 start_training_xxl_2x2x4_10ep.sh`. `sbatch --export` sets the variable before the script's own `export` lines run, so this works because the scripts don't set `MAX_STEPS`. Delete the smoke test's output folder afterwards, or the real run will resume from its checkpoints.
 
 ### 3. Evaluate the model on the full test set
 
@@ -109,17 +115,17 @@ Record the result in `reports/evaluation_summary.tsv`.
 
 ### Training scripts
 
-Training scripts are named `start_training_<model>_<batch>x<accumulation>_<epochs>.sh`. For example, `start_training_xl_4x4_10ep.sh` trains FLAN-T5-XL with 4 examples per step and 4 steps of gradient accumulation (16 examples per update) for 10 epochs.
+Training scripts are named `start_training_<model>_<batch>x<accumulation>x<gpus>_<epochs>.sh`. For example, `start_training_xxl_2x2x4_10ep.sh` trains FLAN-T5-XXL with 2 examples per GPU per step, 2 steps of gradient accumulation and 4 GPUs (2 × 2 × 4 = 16 examples per update) for 10 epochs. Older single-GPU scripts leave out the GPU count: `start_training_xl_4x4_10ep.sh` means 4 × 4 on one GPU.
 
-| Model | Parameters | Scripts |
-|---|---|---|
-| small | 80M | `small_4x4_3ep` |
-| base | 250M | `base_16x1_3ep` |
-| large | 780M | `large_4x4_3ep`, `large_4x4_10ep` |
-| xl | 3B | `xl_4x4_3ep`, `xl_1x16_3ep`, `xl_4x4_10ep`, `xl_1x16_10ep`, `xl_2x8_10ep` |
-| xxl | 11B | `xxl_4x4_10ep`, `xxl_2x8_10ep`, `xxl_1x16_10ep` |
+| Model | Parameters | 1 GPU | 4 GPUs (1 node) | 8 GPUs (2 nodes) |
+|---|---|---|---|---|
+| small | 80M | `small_4x4_3ep` | `small_4x1x4_3ep` | |
+| base | 250M | `base_16x1_3ep` | | |
+| large | 780M | `large_4x4_3ep`, `large_4x4_10ep` | `large_4x1x4_10ep` | |
+| xl | 3B | `xl_4x4_3ep`, `xl_1x16_3ep`, `xl_4x4_10ep`, `xl_1x16_10ep`, `xl_2x8_10ep` | `xl_4x1x4_10ep` | |
+| xxl | 11B | none work (see [Multi-GPU training](#multi-gpu-training)) | `xxl_2x2x4_10ep`, `xxl_1x4x4_10ep` | `xxl_2x1x8_10ep` |
 
-Every configuration updates the model with 16 examples at a time. Configurations with a smaller batch per step, such as 1×16, use less GPU memory but train more slowly.
+Every configuration updates the model with 16 examples at a time: batch per GPU × accumulation steps × number of GPUs = 16. This keeps new runs comparable with the 88.2% XL result. Configurations with a smaller batch per step, such as 1×16, use less GPU memory but train more slowly. The old single-GPU `xxl_*` scripts are kept for reference but always run out of memory.
 
 Each script sets environment variables and runs `t5_train.py`. To create a new configuration, copy a script, change the variables, and give it a new `OUTPUT_DIR`. If two scripts share an output folder, one run will resume from the other's checkpoints.
 
@@ -142,6 +148,10 @@ Each script sets environment variables and runs `t5_train.py`. To create a new c
 | `GENERATION_MAX_NEW_TOKENS` | 128 | Longest SMILES the quick check can generate |
 | `SEED` | 42 | Random seed |
 | `LOCAL_FILES_ONLY` | 0 | Set to 1 on offline nodes after the model is downloaded once |
+| `PARALLEL_MODE` | `none`, or `ddp` under torchrun | `none`: one GPU. `ddp`: every GPU holds a full copy of the model. `fsdp`: the model is split across GPUs. See [Multi-GPU training](#multi-gpu-training) |
+| `DATALOADER_NUM_WORKERS` | 4 | Worker processes per GPU that prepare batches; also used to tokenize the data |
+| `MAX_STEPS` | 0 | Stop after this many model updates, for smoke tests. 0 trains for `NUM_EPOCHS` |
+| `TOKENIZED_CACHE_DIR` | `<OUTPUT_DIR>/tokenized` | Where the tokenized dataset is cached. It is rebuilt when the model, prefix, `TARGET_MAX_LENGTH` or `DATA_DIR` changes |
 
 NMR inputs are never truncated. T5 has no fixed maximum input length, so the whole spectrum is always used. Very long inputs use a lot of GPU memory; if a job runs out of memory, use a configuration with a smaller batch per step.
 
@@ -149,11 +159,46 @@ NMR inputs are never truncated. T5 has no fixed maximum input length, so the who
 
 | File | Purpose |
 |---|---|
-| `evaluate_<model>_<batch>x<accumulation>_<epochs>_array.sh` | Evaluates the model trained by the training script with the same name. Scripts exist for `small_4x4_3ep`, `base_16x1_3ep`, `large_4x4_3ep`, `xl_4x4_3ep`, `xl_1x16_3ep` and `xl_4x4_10ep`. |
+| `evaluate_<configuration>_array.sh` | Evaluates the model trained by the training script with the same configuration name. Scripts exist for `small_4x4_3ep`, `base_16x1_3ep`, `large_4x4_3ep`, `xl_4x4_3ep`, `xl_1x16_3ep` and `xl_4x4_10ep`, and for every multi-GPU configuration: `small_4x1x4_3ep`, `large_4x1x4_10ep`, `xl_4x1x4_10ep`, `xxl_2x2x4_10ep`, `xxl_1x4x4_10ep` and `xxl_2x1x8_10ep`. |
 | `evaluate_check.sh` | Evaluates 10 molecules to confirm a model loads and runs |
 | `test_gpu.sh` | Prints GPU and PyTorch CUDA information for a cluster node |
+| `test_multi_gpu.sh` | Starts one process per GPU with torchrun, checks that they can communicate, and measures the bandwidth between them. `sbatch --nodes=2 test_multi_gpu.sh` checks the network between two nodes |
 
-To evaluate another run, copy an existing evaluation script and change `--model-path` and the job name.
+To evaluate another run, copy an existing evaluation script and change `--model-path` and the job name. Evaluation always uses one GPU per chunk, whichever way the model was trained. Even XXL fits on one GPU for evaluation, because it is loaded in bf16 (about 23 GB).
+
+## Multi-GPU training
+
+An Isambard-AI node has 4 GH200 GPUs, each with 96 GB of memory, connected by NVLink. Multi-GPU scripts start one training process per GPU with `torchrun`, request all 4 GPUs so the job never shares a node, and set `PARALLEL_MODE`.
+
+**Why XXL needs several GPUs.** Full fine-tuning with the AdamW optimizer in mixed precision keeps about 16 bytes per parameter on the GPU: fp32 weights (4), fp32 gradients (4) and two optimizer moments (8). This is before counting activations, the intermediate results kept for the backward pass.
+
+| Model | Training state | 1 GPU | Split over 4 GPUs | Split over 8 GPUs |
+|---|---|---|---|---|
+| large (0.78B) | ~12 GB | fits | – | – |
+| xl (2.85B) | ~46 GB | fits only with gradient checkpointing | ~12 GB | ~6 GB |
+| xxl (11.3B) | ~180 GB | never fits | ~45 GB | ~23 GB |
+
+No batch size or gradient checkpointing setting makes XXL fit on one 96 GB GPU.
+
+**Which mode to use:**
+
+- `ddp` (data parallel), for small, base and large: every GPU holds a full copy of the model and processes different examples. The GPUs average their gradients after each step. Training is about 4 times faster than on one GPU.
+- `fsdp` (fully sharded data parallel), for xl and xxl: the weights, gradients and optimizer state are split across the GPUs. Each GPU briefly gathers one T5 block's weights when it needs them. This is the same optimization as a single-GPU run, just spread over more memory. XL no longer needs gradient checkpointing. XXL still uses it to leave room for activations.
+
+If `xxl_2x2x4_10ep` runs out of GPU memory, use `xxl_1x4x4_10ep`, or `xxl_2x1x8_10ep` on two nodes.
+
+**Checkpoints.** An FSDP checkpoint is stored as one shard per GPU. A job can therefore only resume from a checkpoint written with the same `PARALLEL_MODE` and the same number of GPUs, and a checkpoint from a single-GPU run can't be resumed on 4 GPUs. The final model is gathered into a normal Hugging Face model in `final_model/`, which loads on any number of GPUs. For XXL, each checkpoint takes about 135 GB, because it includes the optimizer state. With `SAVE_TOTAL_LIMIT=2` and the 45 GB final model, one XXL run needs about 315 GB of project storage.
+
+**Host memory.** The multi-GPU scripts request the whole node's memory (`--mem=0`) and all its CPU cores (`--cpus-per-task=288`, 4 × 72 Grace cores). Rank 0 loads the fp32 XXL weights (45 GB) and gathers the full model when saving, and the other processes wait. The tokenized dataset is memory-mapped, so all processes on a node share one copy. If your partition doesn't allow `--mem=0`, request about 360 GB.
+
+**Two nodes.** Within a node, GPUs communicate over NVLink with no extra setup. Between nodes, NCCL needs the aws-ofi-nccl plugin to use the Slingshot network. `start_training_xxl_2x1x8_10ep.sh` and `test_multi_gpu.sh` load `brics/nccl` and `brics/aws-ofi-nccl` and set the variables from the [Isambard-AI NCCL guide](https://docs.isambard.ac.uk/user-documentation/guides/nccl/). Run `sbatch --nodes=2 test_multi_gpu.sh` first. With `NCCL_DEBUG=INFO`, the log should show `NET/AWS Libfabric`. If it shows `NET/Socket`, NCCL has fallen back to TCP, which works but is slow.
+
+**Checking a new setup**, in order:
+
+1. `sbatch test_multi_gpu.sh`: all 4 ranks print their GPU, and rank 0 prints `all_reduce OK` and the bandwidth.
+2. Submit `small_4x1x4_3ep` with `MAX_STEPS=200` and `start_training_small_4x4_3ep.sh` with the same `MAX_STEPS`, and compare their training losses. They should track closely, but not exactly, because the examples are processed in a different order.
+3. Submit `xl_4x1x4_10ep` with `MAX_STEPS=100`, cancel it after its first checkpoint, and resubmit it to check that an FSDP job can save and resume.
+4. Submit `xxl_2x2x4_10ep` with `MAX_STEPS=50`. At the end, rank 0 prints `Peak GPU memory allocated (GB)`.
 
 ## Results
 
@@ -179,6 +224,7 @@ Accuracy improves with model size, with longer inputs and with longer training. 
     evaluate_*_array.sh          Slurm evaluation jobs
     evaluate_check.sh            10-molecule evaluation smoke test
     test_gpu.sh                  GPU check
+    test_multi_gpu.sh            multi-GPU and multi-node communication check
     environment.yml              Conda environment
     environment.txt              full package list of the environment
     data/                        dataset manifest and checksums
@@ -193,3 +239,9 @@ The Slurm scripts are set up for the original cluster. Before running them elsew
 - `#SBATCH --partition=workq` to a GPU partition on your cluster
 - `module load cuda/12.6` to your cluster's CUDA module
 - `source /home/b5an/jucloud.b5an/miniforge3/bin/activate` to your own Conda installation
+
+For multi-GPU scripts, also change:
+
+- `#SBATCH --gres=gpu:4`, `GPUS_PER_NODE=4` and `--cpus-per-task` to match your nodes. Keep batch × accumulation × GPUs at 16.
+- `--mem=0`, if your cluster doesn't allow whole-node memory requests. See the host memory note under [Multi-GPU training](#multi-gpu-training).
+- In the two-node script, the `brics/*` modules and the `NCCL_*`/`FI_*` variables. These are specific to Isambard-AI's Slingshot network. On InfiniBand clusters NCCL usually needs no plugin, and on other networks check your cluster's NCCL documentation.
