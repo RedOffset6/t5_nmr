@@ -1,13 +1,18 @@
 #!/bin/bash
 
 #SBATCH --output=logs/%x_%j.out
-#SBATCH --job-name=flan_t5_small_4x4_3ep
+#SBATCH --job-name=flan_t5_small_4x1x4_3ep
 #SBATCH --partition=workq
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --mem=64GB
+# All 4 GH200s of the node, so the job never shares a node.
+#SBATCH --gres=gpu:4
+# One torchrun per node owns all 4 Grace CPUs (4 x 72 cores).
+#SBATCH --cpus-per-task=288
+# Whole-node host memory: rank 0 holds the fp32 XXL weights while loading
+# and saving, and every rank memory-maps the tokenized dataset.
+#SBATCH --mem=0
 #SBATCH --time=1-00:00:00
-#SBATCH --gres=gpu:1
 
 # Exit immediately if a command fails.
 set -e
@@ -27,9 +32,9 @@ export MODEL_NAME="google/flan-t5-small"
 export TARGET_MAX_LENGTH=128
 
 export TRAIN_BATCH_SIZE=4
-export GRAD_ACCUMULATION_STEPS=4
+export GRAD_ACCUMULATION_STEPS=1
 
-# 4 × 4 × 1 GPU = effective batch size 16.
+# 4 × 1 × 4 GPUs = effective batch size 16.
 export EVAL_BATCH_SIZE=8
 export GENERATION_BATCH_SIZE=8
 
@@ -41,21 +46,37 @@ export SEED=42
 export SAVE_STEPS=2000
 export SAVE_TOTAL_LIMIT=2
 
-# Start with gradient checkpointing disabled.
 export GRADIENT_CHECKPOINTING=0
 
 export TEST_SAMPLE_SIZE=1000
 export GENERATION_MAX_NEW_TOKENS=128
 
 # Explicit output directory prevents accidental checkpoint reuse.
-export OUTPUT_DIR="$SLURM_SUBMIT_DIR/outputs/flan-t5-small_nmr_input1536_4x4_3ep"
+export OUTPUT_DIR="$SLURM_SUBMIT_DIR/outputs/flan-t5-small_nmr_input1536_4x1x4_ep3"
+
+
+# ===== Multi-GPU configuration =====
+
+# ddp for small/base/large, fsdp for xl/xxl.
+export PARALLEL_MODE=ddp
+export GPUS_PER_NODE=4
+export DATALOADER_NUM_WORKERS=4
+
+export MASTER_ADDR=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)
+export MASTER_PORT=$((20000 + SLURM_JOB_ID % 20000))
+export OMP_NUM_THREADS=8
+export TOKENIZERS_PARALLELISM=false
+# INFO for the first multi-node run.
+export NCCL_DEBUG=WARN
+
 
 # ===== Slurm information =====
 
 echo "===== Slurm Job Info ====="
 echo "Job ID: $SLURM_JOB_ID"
 echo "Job name: $SLURM_JOB_NAME"
-echo "Node: $(hostname)"
+echo "Nodes: $SLURM_JOB_NODELIST ($SLURM_JOB_NUM_NODES)"
+echo "Master: $MASTER_ADDR:$MASTER_PORT"
 echo "Start time: $(date)"
 echo "Submission directory: $SLURM_SUBMIT_DIR"
 echo "Working directory: $(pwd)"
@@ -86,9 +107,11 @@ nvidia-smi
 
 echo "===== Shell Training Configuration ====="
 echo "Model: $MODEL_NAME"
+echo "Parallel mode: $PARALLEL_MODE"
+echo "GPUs: $((GPUS_PER_NODE * SLURM_JOB_NUM_NODES))"
 echo "Train batch size per device: $TRAIN_BATCH_SIZE"
 echo "Gradient accumulation steps: $GRAD_ACCUMULATION_STEPS"
-echo "Effective batch size: $((TRAIN_BATCH_SIZE * GRAD_ACCUMULATION_STEPS))"
+echo "Effective batch size: $((TRAIN_BATCH_SIZE * GRAD_ACCUMULATION_STEPS * GPUS_PER_NODE * SLURM_JOB_NUM_NODES))"
 echo "Evaluation batch size: $EVAL_BATCH_SIZE"
 echo "Generation batch size: $GENERATION_BATCH_SIZE"
 echo "Gradient checkpointing: $GRADIENT_CHECKPOINTING"
@@ -100,7 +123,14 @@ echo "Output directory: $OUTPUT_DIR"
 
 echo "===== Start Training ====="
 
-srun python -u t5_train.py
+srun --ntasks-per-node=1 --cpu-bind=none \
+  torchrun \
+    --nnodes="$SLURM_JOB_NUM_NODES" \
+    --nproc-per-node="$GPUS_PER_NODE" \
+    --rdzv-id="$SLURM_JOB_ID" \
+    --rdzv-backend=c10d \
+    --rdzv-endpoint="$MASTER_ADDR:$MASTER_PORT" \
+    t5_train.py
 
 echo "===== Job Finished Successfully ====="
 echo "End time: $(date)"
