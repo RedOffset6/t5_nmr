@@ -20,10 +20,14 @@ conda activate t5
 
 nvidia-smi
 
+# Candidate SMILES generated per spectrum, most likely first (1 = top-1 only).
+NUM_OUTPUTS=10
+
 python evaluate_exact_match.py \
   --model-path outputs/flan-t5-xl_nmr_input1536_4x4_ep10/final_model \
   --data-dir alberts_2d \
   --split test \
+  --num-outputs "$NUM_OUTPUTS" \
   --batch-size 2 \
   --start-index 0 \
   --sample-size 10 \

@@ -38,6 +38,16 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Evaluate exact string match without training the model."
     )
+    parser.add_argument(
+        "--num-outputs",
+        type=int,
+        default=1,
+        help=(
+            "Candidate SMILES to generate per spectrum, most likely first. "
+            "1 uses greedy decoding; larger values use beam search and "
+            "report top-1 to top-N exact match."
+        ),
+    )
     parser.add_argument("--model-path", type=Path, required=True)
     parser.add_argument(
         "--data-dir",
@@ -66,6 +76,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prefix", default=DEFAULT_PREFIX)
     parser.add_argument("--output-file", type=Path, default=None)
     parser.add_argument(
+        "--predictions-file",
+        type=Path,
+        default=None,
+        help=(
+            "Where to write predictions, --num-outputs lines per spectrum. "
+            "Defaults to the output file name with _predictions.txt."
+        ),
+    )
+    parser.add_argument(
         "--save-every",
         type=int,
         default=100,
@@ -80,6 +99,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise FileNotFoundError(f"Model directory not found: {args.model_path}")
     if not args.data_dir.is_dir():
         raise FileNotFoundError(f"Data directory not found: {args.data_dir}")
+    if args.num_outputs <= 0:
+        raise ValueError("--num-outputs must be positive")
     if args.max_new_tokens <= 0:
         raise ValueError("--max-new-tokens must be positive")
     if args.batch_size <= 0:
@@ -142,6 +163,21 @@ def default_output_file(
     return output_dir / filename
 
 
+def default_predictions_file(output_file: Path) -> Path:
+    stem = output_file.stem.removesuffix("_results")
+    return output_file.with_name(f"{stem}_predictions.txt")
+
+
+def top_n_exact_match(
+    top_n_matches: Sequence[int],
+    samples: int,
+) -> Dict[str, float]:
+    return {
+        f"top_{rank}": count / samples
+        for rank, count in enumerate(top_n_matches, start=1)
+    }
+
+
 def write_json(path: Path, data: Dict[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as handle:
@@ -174,6 +210,9 @@ def main() -> None:
         total_count,
     )
     partial_file = output_file.with_suffix(".partial.json")
+    predictions_file = args.predictions_file or default_predictions_file(
+        output_file
+    )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if device.type == "cuda" and torch.cuda.is_bf16_supported():
@@ -188,10 +227,12 @@ def main() -> None:
     print("Split:", args.split, flush=True)
     print(f"Range: [{start_index}, {end_index})", flush=True)
     print(f"Samples: {selected_count} / {total_count}", flush=True)
+    print("Outputs per spectrum:", args.num_outputs, flush=True)
     print("Batch size:", args.batch_size, flush=True)
     print("Device:", device, flush=True)
     print("Dtype:", model_dtype, flush=True)
     print("Output:", output_file, flush=True)
+    print("Predictions:", predictions_file, flush=True)
 
     tokenizer = AutoTokenizer.from_pretrained(
         args.model_path,
@@ -226,11 +267,15 @@ def main() -> None:
         collate_fn=collate_batch,
     )
 
-    matches = 0
+    # top_n_matches[n - 1] counts spectra whose target is in the first n outputs.
+    top_n_matches = [0] * args.num_outputs
     processed = 0
     started_at = time.monotonic()
 
-    with torch.inference_mode():
+    predictions_file.parent.mkdir(parents=True, exist_ok=True)
+    with torch.inference_mode(), predictions_file.open(
+        "w", encoding="utf-8"
+    ) as predictions_handle:
         progress = tqdm(loader, desc="Generating", unit="batch")
         for batch_number, (encoded, targets) in enumerate(progress, start=1):
             encoded = {
@@ -241,16 +286,29 @@ def main() -> None:
                 **encoded,
                 max_new_tokens=args.max_new_tokens,
                 do_sample=False,
-                num_beams=1,
+                num_beams=args.num_outputs,
+                num_return_sequences=args.num_outputs,
             )
-            predictions = tokenizer.batch_decode(
-                generated,
-                skip_special_tokens=True,
-            )
-            matches += sum(
-                prediction.strip() == target
-                for prediction, target in zip(predictions, targets)
-            )
+            predictions = [
+                prediction.strip()
+                for prediction in tokenizer.batch_decode(
+                    generated,
+                    skip_special_tokens=True,
+                )
+            ]
+            for index, target in enumerate(targets):
+                # Beam search returns each spectrum's outputs together, best first.
+                candidates = predictions[
+                    index * args.num_outputs:(index + 1) * args.num_outputs
+                ]
+                predictions_handle.writelines(
+                    candidate + "\n" for candidate in candidates
+                )
+                if target in candidates:
+                    first_rank = candidates.index(target)
+                    for rank in range(first_rank, args.num_outputs):
+                        top_n_matches[rank] += 1
+            predictions_handle.flush()
             processed += len(targets)
 
             if args.save_every and batch_number % args.save_every == 0:
@@ -263,8 +321,13 @@ def main() -> None:
                         "end_index": start_index + processed,
                         "requested_end_index": end_index,
                         "samples": processed,
-                        "matches": matches,
-                        "exact_match": matches / processed,
+                        "matches": top_n_matches[0],
+                        "exact_match": top_n_matches[0] / processed,
+                        "top_n_matches": top_n_matches,
+                        "top_n_exact_match": top_n_exact_match(
+                            top_n_matches,
+                            processed,
+                        ),
                         "elapsed_seconds": time.monotonic() - started_at,
                     },
                 )
@@ -278,8 +341,12 @@ def main() -> None:
         "start_index": start_index,
         "end_index": end_index,
         "samples": processed,
-        "matches": matches,
-        "exact_match": matches / processed,
+        "num_outputs": args.num_outputs,
+        "matches": top_n_matches[0],
+        "exact_match": top_n_matches[0] / processed,
+        "top_n_matches": top_n_matches,
+        "top_n_exact_match": top_n_exact_match(top_n_matches, processed),
+        "predictions_file": str(predictions_file.resolve()),
         "max_new_tokens": args.max_new_tokens,
         "batch_size": args.batch_size,
         "elapsed_seconds": elapsed_seconds,
@@ -290,6 +357,7 @@ def main() -> None:
     print("===== Results =====", flush=True)
     print(json.dumps(results, indent=2, ensure_ascii=False), flush=True)
     print("Saved to:", output_file, flush=True)
+    print("Predictions saved to:", predictions_file, flush=True)
 
 
 if __name__ == "__main__":
