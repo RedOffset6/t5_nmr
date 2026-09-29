@@ -12,6 +12,7 @@ import argparse
 import csv
 import datetime
 import json
+import os
 import re
 import sys
 from pathlib import Path
@@ -41,11 +42,19 @@ def parse_args() -> argparse.Namespace:
         help="Folder with the chunk results; defaults to the run's OUTPUT_DIR",
     )
     parser.add_argument("--split", choices=("validation", "test"), default="test")
-    parser.add_argument("--data-dir", type=Path, default=REPO_DIR / "alberts_2d")
+    parser.add_argument(
+        "--data-dir",
+        type=Path,
+        help=(
+            "Dataset folder, only needed for results from older evaluations, "
+            "which don't record the split size. Defaults to the run's "
+            "DATA_DIR, then the DATA_DIR environment variable."
+        ),
+    )
     parser.add_argument(
         "--total",
         type=int,
-        help="Examples in the split; read from --data-dir when not given",
+        help="Examples in the split, instead of reading it from the data",
     )
     parser.add_argument(
         "--summary",
@@ -60,18 +69,38 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def run_output_dir(run: str) -> Path:
-    """OUTPUT_DIR from configs/train/<run>.env, or outputs/<run>."""
+def config_value(run: str, name: str) -> str | None:
+    """A variable set in configs/train/<run>.env, or None."""
     config = REPO_DIR / "configs" / "train" / f"{run}.env"
     if not config.is_file():
         raise FileNotFoundError(f"No config {config}")
     for line in config.read_text().splitlines():
-        if line.startswith("OUTPUT_DIR="):
-            return REPO_DIR / line.split("=", 1)[1].strip().strip('"')
-    return REPO_DIR / "outputs" / run
+        if line.startswith(f"{name}="):
+            return line.split("=", 1)[1].strip().strip('"')
+    return None
 
 
-def find_chunks(output_dir: Path, split: str, total: int) -> list[dict]:
+def run_output_dir(run: str) -> Path:
+    """OUTPUT_DIR from the run's config, or outputs/<run>."""
+    return REPO_DIR / (config_value(run, "OUTPUT_DIR") or f"outputs/{run}")
+
+
+def split_total(args: argparse.Namespace, chunks: list[dict]) -> int:
+    """Examples in the split: given, recorded in the results, or counted."""
+    if args.total:
+        return args.total
+    recorded = {chunk["split_size"] for chunk in chunks if "split_size" in chunk}
+    if len(recorded) == 1 and all("split_size" in chunk for chunk in chunks):
+        return recorded.pop()
+    data_dir = args.data_dir or config_value(args.run, "DATA_DIR") or os.environ.get("DATA_DIR")
+    if not data_dir:
+        raise ValueError(
+            "These results don't record the split size: pass --total or --data-dir"
+        )
+    return split_size(REPO_DIR / data_dir, args.split)
+
+
+def load_chunks(output_dir: Path, split: str) -> list[dict]:
     pattern = re.compile(rf"{split}_(\d+)_(\d+)_results\.json")
     chunks = []
     for path in output_dir.iterdir():
@@ -81,8 +110,11 @@ def find_chunks(output_dir: Path, split: str, total: int) -> list[dict]:
             chunks.append(result)
     if not chunks:
         raise FileNotFoundError(f"No {split} chunk results in {output_dir}")
+    return sorted(chunks, key=lambda chunk: chunk["start_index"])
 
-    chunks.sort(key=lambda chunk: chunk["start_index"])
+
+def check_tiling(chunks: list[dict], total: int) -> None:
+    """The chunks must cover [0, total) exactly once."""
     expected_start = 0
     for chunk in chunks:
         # Results from older versions of the evaluator have no status.
@@ -99,7 +131,6 @@ def find_chunks(output_dir: Path, split: str, total: int) -> list[dict]:
         raise ValueError(
             f"Chunks cover [0, {expected_start}) but the split has {total} examples"
         )
-    return chunks
 
 
 def chunk_predictions_file(chunk: dict) -> Path:
@@ -144,8 +175,9 @@ def record_summary(summary: Path, row: dict) -> None:
 def main() -> None:
     args = parse_args()
     output_dir = args.output_dir or run_output_dir(args.run)
-    total = args.total or split_size(args.data_dir, args.split)
-    chunks = find_chunks(output_dir, args.split, total)
+    chunks = load_chunks(output_dir, args.split)
+    total = split_total(args, chunks)
+    check_tiling(chunks, total)
 
     num_outputs = min(len(chunk.get("top_n_matches", [0])) for chunk in chunks)
     top_n = [

@@ -11,6 +11,10 @@ export SBATCH_PARTITION="${SBATCH_PARTITION:-workq}"
 CPUS_PER_GPU="${CPUS_PER_GPU:-72}"
 
 
+# Dataset used by runs whose config doesn't set DATA_DIR.
+export DATA_DIR="${DATA_DIR:-/projects/b5an/alberts_2d}"
+
+
 # ===== Job environment =====
 
 CONDA_ROOT="${CONDA_ROOT:-$HOME/miniforge3}"
