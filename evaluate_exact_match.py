@@ -435,6 +435,7 @@ def main() -> None:
         "split": args.split,
         "start_index": start_index,
         "end_index": end_index,
+        "split_size": total_count,
         "samples": selected_count,
         "num_outputs": args.num_outputs,
         "matches": top_n_matches[0],

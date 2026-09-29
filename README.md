@@ -30,7 +30,7 @@ Create the Conda environment (Python 3.11, PyTorch 2.12 with CUDA 12.6, Transfor
 
 `environment.yml` installs `requirements.txt`, which lists only the packages the code uses. To reproduce the exact package set used on Isambard-AI (linux-aarch64), run `pip install -r environment.lock.txt` in the environment instead.
 
-Copy the dataset into `alberts_2d/` next to the scripts. It isn't stored in Git because of its size and possible redistribution restrictions. The folder needs six files:
+The dataset isn't stored in Git because of its size and possible redistribution restrictions. On Isambard-AI it is in `/projects/b5an/alberts_2d`, and jobs read it from there: `DATA_DIR` in `slurm/env.sh` sets the location. Elsewhere, point `DATA_DIR` at your copy. The folder needs six files:
 
     alberts_2d/
       src-train.txt   tgt-train.txt   # 679,213 pairs
@@ -39,7 +39,7 @@ Copy the dataset into `alberts_2d/` next to the scripts. It isn't stored in Git 
 
 Line *N* of each `src-*.txt` file is an NMR spectrum, and line *N* of the matching `tgt-*.txt` file is its SMILES string. Check your copy against the checksums in `data/manifest.tsv`:
 
-    sha256sum alberts_2d/*.txt
+    cd /projects/b5an && sha256sum alberts_2d/*.txt
 
 Check the cluster settings in `slurm/env.sh`: the partition, the CUDA module, and `CONDA_ROOT` (default `~/miniforge3`). Then check that a GPU node works before using hours of GPU time:
 
@@ -111,6 +111,8 @@ This script:
 - joins the chunks' predictions into `prd-test.txt` in the output folder;
 - records the top-1 score in `reports/evaluation_summary.tsv` under the run name. Combining a run again replaces its row.
 
+Each chunk's results record the size of the test set. Results from evaluations made before this was added don't, so for those the script counts the test set in the run's `DATA_DIR`, or in the folder given by `--data-dir`. `--total 79441` skips the count.
+
 ## Runs
 
 Each file in `configs/train/` is one run. It holds only the settings that differ from the defaults, for example `configs/train/xxl_2x2x4_10ep.env`:
@@ -166,7 +168,7 @@ A config sets any of these. Variables that a config doesn't set can also be give
 | Variable | Default | Meaning |
 |---|---|---|
 | `MODEL_NAME` | `google/flan-t5-base` | Hugging Face model to fine-tune |
-| `DATA_DIR` | `alberts_2d` | Folder with the `src-*`/`tgt-*` files |
+| `DATA_DIR` | `/projects/b5an/alberts_2d` (from `slurm/env.sh`) | Folder with the `src-*`/`tgt-*` files. A relative path is relative to the repository |
 | `OUTPUT_DIR` | `outputs/<run>` | Where checkpoints and the final model go |
 | `TRAIN_BATCH_SIZE` | 16 | Examples per GPU per step |
 | `GRAD_ACCUMULATION_STEPS` | 1 | Steps combined into each model update |
@@ -257,7 +259,7 @@ These changes need a comparison before they become defaults, because they change
 - Disabling gradient checkpointing for single-GPU XL runs, if `probe_xl_4x4_nogc` shows it fits.
 - Longer `TARGET_MAX_LENGTH`, or adding SMILES characters the T5 tokenizer can't represent. `scripts/dataset_stats.py` measures both (see below). Runs with a changed tokenizer aren't comparable with the 88.2% result.
 
-**Dataset statistics.** `python scripts/dataset_stats.py --model-name google/flan-t5-base` writes `reports/dataset_stats.json`. It needs only the tokenizer, not a GPU. It reports:
+**Dataset statistics.** `python scripts/dataset_stats.py --model-name google/flan-t5-base --data-dir /projects/b5an/alberts_2d` writes `reports/dataset_stats.json`. It needs only the tokenizer, not a GPU. It reports:
 
 - token-length percentiles of spectra and SMILES;
 - the share of SMILES longer than `TARGET_MAX_LENGTH`;
@@ -310,7 +312,7 @@ GitHub Actions runs both on every push (`.github/workflows/smoke.yml`). `python 
     data/                        dataset manifest and checksums
     reports/                     evaluation results
 
-These folders are created locally and aren't stored in Git: `alberts_2d/` (dataset), `outputs/` (models and checkpoints) and `logs/` (Slurm logs). `nmr_expt_data/` is a second dataset listed in `data/manifest.tsv`; the current scripts don't use it.
+These folders are created locally and aren't stored in Git: `outputs/` (models and checkpoints) and `logs/` (Slurm logs). The datasets live outside the repository. `nmr_expt_data` is a second dataset listed in `data/manifest.tsv`, in `/projects/b5an/nmr_expt_data`; to train on it, set `DATA_DIR` to that folder in a run's config.
 
 ## Running on another cluster
 

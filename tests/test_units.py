@@ -10,7 +10,7 @@ REPO_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_DIR))
 sys.path.insert(0, str(REPO_DIR / "scripts"))
 
-from combine_results import find_chunks, record_summary  # noqa: E402
+from combine_results import check_tiling, load_chunks, record_summary  # noqa: E402
 from evaluate_exact_match import count_match, resume_predictions  # noqa: E402
 
 
@@ -52,11 +52,12 @@ def write_chunk(directory: Path, start: int, end: int, matches: list[int]) -> No
     )
 
 
-def test_find_chunks_accepts_exact_tiling(tmp_path):
+def test_chunks_accepted_when_they_tile_the_split(tmp_path):
     write_chunk(tmp_path, 5, 10, [1, 2])
     write_chunk(tmp_path, 0, 5, [3, 4])
-    chunks = find_chunks(tmp_path, "test", 10)
+    chunks = load_chunks(tmp_path, "test")
     assert [chunk["start_index"] for chunk in chunks] == [0, 5]
+    check_tiling(chunks, 10)
 
 
 @pytest.mark.parametrize(
@@ -67,11 +68,11 @@ def test_find_chunks_accepts_exact_tiling(tmp_path):
         [(0, 4), (5, 10)],  # gap
     ],
 )
-def test_find_chunks_rejects_bad_tiling(tmp_path, ranges):
+def test_chunks_rejected_when_they_dont_tile_the_split(tmp_path, ranges):
     for start, end in ranges:
         write_chunk(tmp_path, start, end, [0])
     with pytest.raises(ValueError):
-        find_chunks(tmp_path, "test", 10)
+        check_tiling(load_chunks(tmp_path, "test"), 10)
 
 
 def test_record_summary_replaces_row_of_same_run(tmp_path):
@@ -82,3 +83,16 @@ def test_record_summary_replaces_row_of_same_run(tmp_path):
     lines = summary.read_text().splitlines()
     assert len(lines) == 2
     assert lines[1].split("\t")[3] == "0.6"
+
+
+def test_split_size_read_from_results(tmp_path):
+    import argparse
+
+    from combine_results import split_total
+
+    write_chunk(tmp_path, 0, 10, [1])
+    chunks = load_chunks(tmp_path, "test")
+    for chunk in chunks:
+        chunk["split_size"] = 10
+    args = argparse.Namespace(total=None, data_dir=None, run="unused", split="test")
+    assert split_total(args, chunks) == 10

@@ -16,6 +16,7 @@ Results are printed and written as JSON to --output.
 
 import argparse
 import json
+import os
 import random
 import sys
 from collections import Counter
@@ -36,7 +37,11 @@ PERCENTILES = (50, 90, 99, 99.9, 100)
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--model-name", default="google/flan-t5-base")
-    parser.add_argument("--data-dir", type=Path, default=REPO_DIR / "alberts_2d")
+    parser.add_argument(
+        "--data-dir",
+        type=Path,
+        default=Path(os.environ.get("DATA_DIR", REPO_DIR / "alberts_2d")),
+    )
     parser.add_argument(
         "--splits", nargs="+", default=list(SPLIT_FILES), choices=list(SPLIT_FILES)
     )
