@@ -69,17 +69,32 @@ Submit the evaluation script with the same name as the training script:
 
     sbatch evaluate_xl_4x4_10ep_array.sh
 
-This is a Slurm array job. It splits the 79,441 test molecules into 4 chunks of 20,000 and evaluates them in parallel on separate GPUs. Each chunk writes its score to `outputs/<run>/test_<start>_<end>_results.json`. While a chunk is running, it saves progress every 100 batches to a matching `.partial.json` file.
+This is a Slurm array job. It splits the 79,441 test molecules into 4 chunks of 20,000 and evaluates them in parallel on separate GPUs. Each chunk writes two files to `outputs/<run>/`:
 
-The model predicts with greedy decoding, and a prediction counts as correct only if it is **exactly** the same string as the reference SMILES.
+- `test_<start>_<end>_results.json`: top-1 to top-N exact-match scores. While a chunk is running, it saves progress every 100 batches to a matching `.partial.json` file.
+- `test_<start>_<end>_predictions.txt`: the model's N most likely SMILES for each spectrum, one per line, best first. Spectrum *i* in the chunk occupies lines *i*·N + 1 to (*i* + 1)·N. This is the same layout as `prd-test.txt` from earlier models.
+
+**Number of outputs per spectrum:** set `NUM_OUTPUTS` near the top of the evaluation script (default 10). The script passes it to `evaluate_exact_match.py --num-outputs`.
+
+- `NUM_OUTPUTS=1` uses greedy decoding and only reports top-1.
+- `NUM_OUTPUTS=N` (N > 1) uses beam search with N beams and returns the N highest-scoring SMILES. Top-*n* accuracy counts a spectrum as correct if the reference SMILES is anywhere in the first *n* outputs. Beam search can also change the top-1 prediction, so its top-1 score may differ slightly from greedy decoding.
+- More outputs make evaluation slower and use more GPU memory. If a chunk runs out of memory or time, lower `NUM_OUTPUTS` or `--batch-size`, or raise `#SBATCH --time`.
+
+A prediction counts as correct only if it is **exactly** the same string as the reference SMILES.
 
 To test a trained model on just 10 molecules first, run `sbatch evaluate_check.sh`.
 
 ### 4. Combine the results
 
-Combine the four chunks, weighting each by its number of molecules:
+Combine the four chunks' top-1 to top-N scores, weighting each chunk by its number of molecules:
 
-    python -c "import json,glob,sys; r=[json.load(open(f)) for f in glob.glob(sys.argv[1]+'/test_*_results.json')]; print(sum(x['matches'] for x in r)/sum(x['samples'] for x in r))" outputs/flan-t5-xl_nmr_input1536_4x4_ep10
+    python -c "import json,glob,sys; r=[json.load(open(f)) for f in glob.glob(sys.argv[1]+'/test_*_results.json')]; n=sum(x['samples'] for x in r); t=[sum(c) for c in zip(*(x.get('top_n_matches',[x['matches']]) for x in r))]; [print(f'top-{k}: {c/n:.4f}') for k,c in enumerate(t,1)]" outputs/flan-t5-xl_nmr_input1536_4x4_ep10
+
+Join the four prediction files, in order, into one file for the whole test set:
+
+    cd outputs/flan-t5-xl_nmr_input1536_4x4_ep10
+    cat test_0_20000_predictions.txt test_20000_40000_predictions.txt \
+        test_40000_60000_predictions.txt test_60000_79441_predictions.txt > prd-test.txt
 
 Record the result in `reports/evaluation_summary.tsv`.
 
@@ -90,7 +105,7 @@ Record the result in `reports/evaluation_summary.tsv`.
 | File | Purpose |
 |---|---|
 | `t5_train.py` | Training pipeline shared by every training script. It is configured entirely through environment variables (see below). |
-| `evaluate_exact_match.py` | Loads a trained `final_model`, predicts SMILES for a range of test molecules, and scores exact match. Run `python evaluate_exact_match.py --help` for its options. |
+| `evaluate_exact_match.py` | Loads a trained `final_model`, predicts the N most likely SMILES (`--num-outputs`) for a range of test molecules, scores top-1 to top-N exact match, and saves the predictions. Run `python evaluate_exact_match.py --help` for its options. |
 
 ### Training scripts
 

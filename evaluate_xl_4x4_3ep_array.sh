@@ -19,17 +19,22 @@ module load cuda/12.6
 source /home/b5an/jucloud.b5an/miniforge3/bin/activate
 conda activate t5
 
+# Candidate SMILES generated per spectrum, most likely first (1 = top-1 only).
+NUM_OUTPUTS=10
+
 CHUNK_SIZE=20000
 START_INDEX=$((SLURM_ARRAY_TASK_ID * CHUNK_SIZE))
 
 echo "Array task: $SLURM_ARRAY_TASK_ID"
 echo "Start index: $START_INDEX"
 echo "Chunk size: $CHUNK_SIZE"
+echo "Outputs per spectrum: $NUM_OUTPUTS"
 
 python evaluate_exact_match.py \
   --model-path outputs/flan-t5-xl_nmr_input1536_bs4x4_3ep/final_model \
   --data-dir alberts_2d \
   --split test \
+  --num-outputs "$NUM_OUTPUTS" \
   --batch-size 2 \
   --start-index "$START_INDEX" \
   --sample-size "$CHUNK_SIZE" \
