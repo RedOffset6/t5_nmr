@@ -32,6 +32,7 @@ echo "Run: $RUN ($RUN_CONFIG)"
 echo "Job ID: $SLURM_JOB_ID"
 echo "Nodes: $SLURM_JOB_NODELIST ($SLURM_JOB_NUM_NODES)"
 echo "GPUs per node: $GPUS_PER_NODE"
+echo "Global batch: $GLOBAL_BATCH"
 echo "Start time: $(date)"
 echo "Time limit ends: $(date -d "@$SLURM_JOB_END_TIME" 2>/dev/null || echo unknown)"
 echo "Resubmission: ${RESUBMIT_COUNT:-0} of ${MAX_RESUBMITS:-20}"
@@ -54,20 +55,23 @@ if [ $((NODES * GPUS_PER_NODE)) -gt 1 ]; then
   if [ "$NODES" -gt 1 ]; then
     setup_multinode_nccl
   fi
+  # srun starts one task per GPU (see submit.sh); each becomes one training
+  # process, and the Trainer starts NCCL from these variables.
   export MASTER_ADDR=$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)
   export MASTER_PORT=$((20000 + SLURM_JOB_ID % 20000))
+  export WORLD_SIZE="$SLURM_NTASKS"
+  # Not 72: the CPU work is data loading, and more threads per rank would
+  # compete with the dataloader workers.
   export OMP_NUM_THREADS=8
+  export DATALOADER_NUM_WORKERS="${DATALOADER_NUM_WORKERS:-8}"
   export TOKENIZERS_PARALLELISM=false
   export NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
 
-  srun --ntasks-per-node=1 --cpu-bind=none \
-    torchrun \
-      --nnodes="$SLURM_JOB_NUM_NODES" \
-      --nproc-per-node="$GPUS_PER_NODE" \
-      --rdzv-id="$SLURM_JOB_ID" \
-      --rdzv-backend=c10d \
-      --rdzv-endpoint="$MASTER_ADDR:$MASTER_PORT" \
-      t5_train.py
+  srun --cpu-bind=cores bash -c '
+    export RANK=$SLURM_PROCID
+    export LOCAL_RANK=$SLURM_LOCALID
+    exec python -u t5_train.py
+  '
 else
   srun python -u t5_train.py
 fi
