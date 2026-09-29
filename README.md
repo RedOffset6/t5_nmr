@@ -5,10 +5,11 @@ This repository contains training and evaluation code for predicting molecular S
 ## Repository contents
 
 - `t5_train.py`: shared training pipeline.
-- `t5_base.py`, `t5_large.py`, `t5_xl.py`, `t5_nmr.py`: model-specific or earlier training implementations.
 - `start_training_*.sh`: Slurm configurations for different model sizes, input lengths, batch sizes, and epoch counts.
 - `evaluate_exact_match.py`: exact-match evaluation program.
 - `evaluate_*.sh`: Slurm array jobs for model evaluation.
+- `evaluate_check.sh`: 10-sample evaluation smoke test.
+- `test_gpu.sh`: checks that PyTorch can see the GPU on a cluster node.
 - `reports/`: chunk-level and aggregated exact-match results.
 - `data/manifest.tsv`: dataset file sizes, line counts, and SHA-256 checksums.
 
