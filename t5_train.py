@@ -1,383 +1,65 @@
+"""Fine-tune FLAN-T5 to predict SMILES from NMR spectra.
+
+Configured through environment variables (see config.py and the README).
+Run with plain `python t5_train.py` on one GPU, or under torchrun with
+PARALLEL_MODE=ddp or fsdp on several.
+"""
+
 import json
 import os
-import random
-import shutil
+import time
 from pathlib import Path
 
-import numpy as np
 import torch
-from datasets import Dataset, DatasetDict, load_from_disk
-from torch.utils.data import DataLoader
 from transformers import (
     AutoModelForSeq2SeqLM,
     AutoTokenizer,
     DataCollatorForSeq2Seq,
     Seq2SeqTrainer,
     Seq2SeqTrainingArguments,
+    TrainerCallback,
 )
 from transformers.trainer_utils import get_last_checkpoint
 
-
-# Paths are resolved relative to this file, not the directory used to launch it.
-BASE_DIR = Path(__file__).resolve().parent
-
-# ===== Experiment identity =====
-
-MODEL_NAME = os.environ.get(
-    "MODEL_NAME",
-    "google/flan-t5-base",
-)
-
-TARGET_MAX_LENGTH = int(
-    os.environ.get("TARGET_MAX_LENGTH", "128")
-)
-
-DATA_DIR = Path(
-    os.environ.get(
-        "DATA_DIR",
-        BASE_DIR / "alberts_2d",
-    )
-)
-
-# Convert google/flan-t5-base into flan-t5-base.
-MODEL_SHORT_NAME = MODEL_NAME.split("/")[-1]
-
-# Each model receives an independent folder.
-DEFAULT_OUTPUT_DIR = (
-    BASE_DIR
-    / "outputs"
-    / f"{MODEL_SHORT_NAME}_nmr"
-)
-
-OUTPUT_DIR = Path(
-    os.environ.get(
-        "OUTPUT_DIR",
-        DEFAULT_OUTPUT_DIR,
-    )
-)
+from config import TrainConfig
+from evaluate_exact_match import run_evaluation
+from nmr_data import load_split, load_tokenized_splits
 
 
-TOKENIZED_CACHE_DIR = Path(
-    os.environ.get(
-        "TOKENIZED_CACHE_DIR",
-        OUTPUT_DIR / "tokenized",
-    )
-)
+class StopBeforeTimeLimit(TrainerCallback):
+    """Save a checkpoint and stop cleanly before Slurm kills the job.
 
+    Every rank must stop at the same step, or the others would wait forever
+    in the next collective, so the ranks agree on the decision with an
+    all-reduce. It runs every check_every steps to keep its cost negligible.
+    """
 
-# ===== Distributed training =====
+    def __init__(self, deadline: float, device: torch.device, check_every: int = 10):
+        self.deadline = deadline
+        self.device = device
+        self.check_every = check_every
+        self.stopped = False
 
-# torchrun sets these for every process; a plain `python t5_train.py` run
-# has none of them and trains in a single process.
-WORLD_SIZE = int(os.environ.get("WORLD_SIZE", "1"))
-RANK = int(os.environ.get("RANK", "0"))
-LOCAL_RANK = int(os.environ.get("LOCAL_RANK", "0"))
-
-# none: one process, one GPU. ddp: every GPU holds the full model.
-# fsdp: parameters, gradients and optimizer state are sharded across GPUs.
-PARALLEL_MODE = os.environ.get(
-    "PARALLEL_MODE",
-    "ddp" if WORLD_SIZE > 1 else "none",
-).strip().lower()
-
-if PARALLEL_MODE not in {"none", "ddp", "fsdp"}:
-    raise ValueError(
-        f"PARALLEL_MODE must be none, ddp or fsdp, got {PARALLEL_MODE!r}"
-    )
-if (PARALLEL_MODE == "none") != (WORLD_SIZE == 1):
-    raise ValueError(
-        f"PARALLEL_MODE={PARALLEL_MODE} does not match WORLD_SIZE={WORLD_SIZE}: "
-        "use PARALLEL_MODE=none with plain python, ddp or fsdp with torchrun."
-    )
-
-DATALOADER_NUM_WORKERS = int(
-    os.environ.get("DATALOADER_NUM_WORKERS", "4")
-)
-
-# 0 trains for NUM_EPOCHS; a positive value stops after that many optimizer
-# steps, for short smoke tests of the whole pipeline.
-MAX_STEPS = int(
-    os.environ.get("MAX_STEPS", "0")
-)
-
-
-def is_main_process() -> bool:
-    return RANK == 0
-
-
-# ===== Reproducibility =====
-
-SEED = int(os.environ.get("SEED", "42"))
-PREFIX = os.environ.get(
-    "PREFIX",
-    "predict SMILES from NMR spectrum: ",
-)
-
-
-# ===== Optimisation =====
-
-LEARNING_RATE = float(
-    os.environ.get("LEARNING_RATE", "5e-5")
-)
-
-TRAIN_BATCH_SIZE = int(
-    os.environ.get("TRAIN_BATCH_SIZE", "16")
-)
-
-EVAL_BATCH_SIZE = int(
-    os.environ.get("EVAL_BATCH_SIZE", "32")
-)
-
-GRAD_ACCUMULATION_STEPS = int(
-    os.environ.get("GRAD_ACCUMULATION_STEPS", "1")
-)
-
-NUM_EPOCHS = float(
-    os.environ.get("NUM_EPOCHS", "3")
-)
-
-WEIGHT_DECAY = float(
-    os.environ.get("WEIGHT_DECAY", "0.01")
-)
-
-
-# ===== Checkpointing =====
-
-SAVE_STEPS = int(
-    os.environ.get("SAVE_STEPS", "2000")
-)
-
-SAVE_TOTAL_LIMIT = int(
-    os.environ.get("SAVE_TOTAL_LIMIT", "2")
-)
-
-
-# ===== Generation test =====
-
-TEST_SAMPLE_SIZE = int(
-    os.environ.get("TEST_SAMPLE_SIZE", "1000")
-)
-
-GENERATION_BATCH_SIZE = int(
-    os.environ.get("GENERATION_BATCH_SIZE", "32")
-)
-
-GENERATION_MAX_NEW_TOKENS = int(
-    os.environ.get("GENERATION_MAX_NEW_TOKENS", "128")
-)
-
-def get_env_bool(name: str, default: bool = False) -> bool:
-    value = os.environ.get(name)
-
-    if value is None:
-        return default
-
-    return value.strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
-
-
-GRADIENT_CHECKPOINTING = get_env_bool(
-    "GRADIENT_CHECKPOINTING",
-    False,
-)
-
-
-def set_seed(seed: int) -> None:
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-
-
-def read_lines(path: Path) -> list[str]:
-    if not path.is_file():
-        raise FileNotFoundError(f"Required data file not found: {path}")
-    with path.open("r", encoding="utf-8") as file:
-        return [line.strip() for line in file]
-
-
-def build_split(src_path: Path, tgt_path: Path) -> Dataset:
-    src_lines = read_lines(src_path)
-    tgt_lines = read_lines(tgt_path)
-    if len(src_lines) != len(tgt_lines):
-        raise ValueError(
-            "Line count mismatch:\n"
-            f"{src_path}: {len(src_lines)} lines\n"
-            f"{tgt_path}: {len(tgt_lines)} lines"
+    def on_step_end(self, args, state, control, **kwargs):
+        if state.global_step % self.check_every:
+            return
+        stop = torch.tensor(
+            [float(time.time() >= self.deadline)], device=self.device
         )
-    return Dataset.from_dict({"src": src_lines, "tgt": tgt_lines})
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.all_reduce(stop, op=torch.distributed.ReduceOp.MAX)
+        if stop.item():
+            self.stopped = True
+            control.should_save = True
+            control.should_training_stop = True
 
 
-def load_splits(data_dir: Path) -> DatasetDict:
-    return DatasetDict(
-        {
-            "train": build_split(
-                data_dir / "src-train.txt", data_dir / "tgt-train.txt"
-            ),
-            "validation": build_split(
-                data_dir / "src-val.txt", data_dir / "tgt-val.txt"
-            ),
-            "test": build_split(
-                data_dir / "src-test.txt", data_dir / "tgt-test.txt"
-            ),
-        }
-    )
-
-
-def print_configuration(
-    dataset: DatasetDict,
-    use_bf16: bool,
-) -> None:
-    """Print the complete experiment configuration."""
-
-    # One training process per GPU, so WORLD_SIZE is the number of GPUs.
-    global_effective_batch_size = (
-        TRAIN_BATCH_SIZE
-        * GRAD_ACCUMULATION_STEPS
-        * WORLD_SIZE
-    )
-
-    print("===== Experiment Configuration =====")
-
-    print("PyTorch:", torch.__version__)
-    print("CUDA available:", torch.cuda.is_available())
-    print("Visible GPU count:", torch.cuda.device_count())
-
-    if torch.cuda.is_available():
-        print(
-            f"GPU {LOCAL_RANK}:",
-            torch.cuda.get_device_name(LOCAL_RANK),
-        )
-
-    print("Parallel mode:", PARALLEL_MODE)
-    print("World size (GPUs):", WORLD_SIZE)
-    print("Nodes:", os.environ.get("SLURM_JOB_NUM_NODES", "1"))
-
-    print("BF16 enabled:", use_bf16)
-
-    print("Model:", MODEL_NAME)
-    print("Data directory:", DATA_DIR)
-    print("Output directory:", OUTPUT_DIR)
-
-    print("Train rows:", len(dataset["train"]))
-    print("Validation rows:", len(dataset["validation"]))
-    print("Test rows:", len(dataset["test"]))
-
-    print("Target max length:", TARGET_MAX_LENGTH)
-
-    print("Learning rate:", LEARNING_RATE)
-    print("Weight decay:", WEIGHT_DECAY)
-    print("Epochs:", NUM_EPOCHS)
-
-    print(
-        "Train batch size per device:",
-        TRAIN_BATCH_SIZE,
-    )
-    print(
-        "Gradient accumulation steps:",
-        GRAD_ACCUMULATION_STEPS,
-    )
-    print(
-        "Global effective train batch size:",
-        global_effective_batch_size,
-    )
-
-    print("Evaluation batch size:", EVAL_BATCH_SIZE)
-    print(
-        "Generation batch size:",
-        GENERATION_BATCH_SIZE,
-    )
-    print(
-        "Generation test rows:",
-        min(TEST_SAMPLE_SIZE, len(dataset["test"])),
-    )
-    print(
-        "Generation max new tokens:",
-        GENERATION_MAX_NEW_TOKENS,
-    )
-
-    print(
-        "Gradient checkpointing:",
-        GRADIENT_CHECKPOINTING,
-    )
-    print("Dataloader workers:", DATALOADER_NUM_WORKERS)
-    print("Max steps:", MAX_STEPS if MAX_STEPS > 0 else "unlimited")
-    print("Tokenized cache:", TOKENIZED_CACHE_DIR)
-
-    print("Save strategy: steps")
-    print("Save every optimizer steps:", SAVE_STEPS)
-    print(
-        "Checkpoint retention limit:",
-        SAVE_TOTAL_LIMIT,
-    )
-
-    print("Random seed:", SEED)
-    print("====================================")
-
-def generate_test_metrics(
-    model, tokenizer, test_dataset: Dataset, device: torch.device
-) -> dict[str, float]:
-    """Generate a bounded test subset and report exact string-match accuracy."""
-    sample_count = min(TEST_SAMPLE_SIZE, len(test_dataset))
-    if sample_count == 0:
-        return {"test_exact_match": 0.0, "test_samples": 0}
-
-    subset = test_dataset.select(range(sample_count))
-
-    def collate(examples):
-        inputs = [PREFIX + example["src"] for example in examples]
-        encoded = tokenizer(
-            inputs,
-            truncation=False,
-            padding=True,
-            return_tensors="pt",
-        )
-        targets = [example["tgt"].strip() for example in examples]
-        return encoded, targets
-
-    loader = DataLoader(
-        subset,
-        batch_size=GENERATION_BATCH_SIZE,
-        shuffle=False,
-        collate_fn=collate,
-    )
-    model.eval()
-    matches = 0
-
-    with torch.inference_mode():
-        for encoded, targets in loader:
-            encoded = {key: value.to(device) for key, value in encoded.items()}
-            generated = model.generate(
-                **encoded,
-                max_new_tokens=GENERATION_MAX_NEW_TOKENS,
-                do_sample=False,
-                num_beams=1,
-            )
-            predictions = tokenizer.batch_decode(
-                generated, skip_special_tokens=True
-            )
-            matches += sum(
-                prediction.strip() == target
-                for prediction, target in zip(predictions, targets)
-            )
-
-    return {
-        "test_exact_match": matches / sample_count,
-        "test_samples": sample_count,
-    }
-
-
-def save_metrics_file(split: str, metrics: dict) -> None:
+def save_metrics_file(output_dir: Path, split: str, metrics: dict) -> None:
     """Write <split>_results.json and all_results.json like Trainer.save_metrics."""
-    with (OUTPUT_DIR / f"{split}_results.json").open("w") as file:
+    with (output_dir / f"{split}_results.json").open("w") as file:
         json.dump(metrics, file, indent=4, sort_keys=True)
 
-    all_results_path = OUTPUT_DIR / "all_results.json"
+    all_results_path = output_dir / "all_results.json"
     all_metrics = {}
     if all_results_path.is_file():
         with all_results_path.open() as file:
@@ -387,78 +69,32 @@ def save_metrics_file(split: str, metrics: dict) -> None:
         json.dump(all_metrics, file, indent=4, sort_keys=True)
 
 
-def tokenize_splits(tokenizer) -> DatasetDict:
-    """Tokenise the train/validation/test splits read from DATA_DIR."""
-
-    def preprocess(examples):
-        model_inputs = tokenizer(
-            [PREFIX + source for source in examples["src"]],
-            truncation=False,
-        )
-        labels = tokenizer(
-            text_target=examples["tgt"],
-            max_length=TARGET_MAX_LENGTH,
-            truncation=True,
-        )
-        model_inputs["labels"] = labels["input_ids"]
-        return model_inputs
-
-    return load_splits(DATA_DIR).map(
-        preprocess,
-        batched=True,
-        remove_columns=["src", "tgt"],
-        num_proc=max(DATALOADER_NUM_WORKERS, 1),
-        desc="Tokenizing dataset",
+def final_model_is_complete(final_model_dir: Path) -> bool:
+    return (final_model_dir / "config.json").is_file() and any(
+        (final_model_dir / name).is_file()
+        for name in ("model.safetensors", "model.safetensors.index.json")
     )
 
 
-def load_tokenized_dataset(tokenizer, training_args) -> DatasetDict:
-    """Tokenise once per job on rank 0; every rank then memory-maps the result.
-
-    load_from_disk memory-maps the Arrow files, so the processes on a node
-    share one copy of the data instead of each holding its own.
-    """
-    fingerprint = {
-        "model_name": MODEL_NAME,
-        "prefix": PREFIX,
-        "target_max_length": TARGET_MAX_LENGTH,
-        "data_dir": str(DATA_DIR.resolve()),
-    }
-    fingerprint_path = TOKENIZED_CACHE_DIR / "t5_train_fingerprint.json"
-
-    with training_args.main_process_first(local=False, desc="dataset tokenization"):
-        if is_main_process():
-            if (
-                fingerprint_path.is_file()
-                and json.loads(fingerprint_path.read_text()) == fingerprint
-            ):
-                print("Using tokenized dataset cache:", TOKENIZED_CACHE_DIR)
-            else:
-                # Write to a temporary folder and rename it at the end, so an
-                # interrupted job never leaves a cache that looks complete.
-                partial_dir = TOKENIZED_CACHE_DIR.with_name(
-                    TOKENIZED_CACHE_DIR.name + ".partial"
-                )
-                shutil.rmtree(partial_dir, ignore_errors=True)
-                tokenize_splits(tokenizer).save_to_disk(str(partial_dir))
-                (partial_dir / fingerprint_path.name).write_text(
-                    json.dumps(fingerprint, indent=4)
-                )
-                shutil.rmtree(TOKENIZED_CACHE_DIR, ignore_errors=True)
-                partial_dir.rename(TOKENIZED_CACHE_DIR)
-                print("Tokenized dataset saved to:", TOKENIZED_CACHE_DIR)
-
-        return load_from_disk(str(TOKENIZED_CACHE_DIR))
+def print_config(config: TrainConfig, use_bf16: bool) -> None:
+    print("===== Experiment Configuration =====")
+    print("PyTorch:", torch.__version__)
+    if torch.cuda.is_available():
+        print(f"GPU {config.local_rank}:", torch.cuda.get_device_name(config.local_rank))
+    print("bf16:", use_bf16)
+    for key, value in config.to_dict().items():
+        print(f"{key}: {value}")
+    print("====================================")
 
 
-def build_training_args(use_bf16: bool) -> Seq2SeqTrainingArguments:
+def build_training_args(config: TrainConfig, use_bf16: bool) -> Seq2SeqTrainingArguments:
     parallel_args = {}
 
-    if PARALLEL_MODE == "ddp":
+    if config.parallel_mode == "ddp":
         # T5 uses every parameter in each step, so DDP can skip the search.
         parallel_args["ddp_find_unused_parameters"] = False
 
-    if PARALLEL_MODE == "fsdp":
+    if config.parallel_mode == "fsdp":
         # Keys as read by transformers 5.12 (TrainingArguments._process_fsdp_args).
         parallel_args["fsdp"] = True
         parallel_args["fsdp_config"] = {
@@ -474,154 +110,201 @@ def build_training_args(use_bf16: bool) -> Seq2SeqTrainingArguments:
             "state_dict_type": "SHARDED_STATE_DICT",
         }
 
+    if config.group_by_length:
+        parallel_args["train_sampling_strategy"] = "group_by_length"
+
     return Seq2SeqTrainingArguments(
-        output_dir=str(OUTPUT_DIR),
-
+        output_dir=str(config.output_dir),
         eval_strategy="epoch",
-
         save_strategy="steps",
-        save_steps=SAVE_STEPS,
-        save_total_limit=SAVE_TOTAL_LIMIT,
-
+        save_steps=config.save_steps,
+        save_total_limit=config.save_total_limit,
         logging_strategy="steps",
         logging_steps=500,
-
-        learning_rate=LEARNING_RATE,
-        per_device_train_batch_size=TRAIN_BATCH_SIZE,
-        per_device_eval_batch_size=EVAL_BATCH_SIZE,
-        gradient_accumulation_steps=GRAD_ACCUMULATION_STEPS,
-        gradient_checkpointing=GRADIENT_CHECKPOINTING,
-
-        weight_decay=WEIGHT_DECAY,
-        num_train_epochs=NUM_EPOCHS,
-        max_steps=MAX_STEPS if MAX_STEPS > 0 else -1,
-
+        learning_rate=config.learning_rate,
+        per_device_train_batch_size=config.train_batch_size,
+        per_device_eval_batch_size=config.eval_batch_size,
+        gradient_accumulation_steps=config.grad_accumulation_steps,
+        gradient_checkpointing=config.gradient_checkpointing,
+        weight_decay=config.weight_decay,
+        num_train_epochs=config.num_epochs,
+        max_steps=config.max_steps if config.max_steps > 0 else -1,
         predict_with_generate=False,
+        # T5 overflows in fp16, so without bf16 support train in fp32.
         bf16=use_bf16,
-        fp16=torch.cuda.is_available() and not use_bf16,
-
-        dataloader_num_workers=DATALOADER_NUM_WORKERS,
+        dataloader_num_workers=config.dataloader_num_workers,
         dataloader_pin_memory=torch.cuda.is_available(),
         push_to_hub=False,
         report_to="none",
-
         # Rank 0 tokenises the dataset and gathers the full XXL state dict
         # while the other ranks wait; both can exceed the 30-minute default.
         ddp_timeout=7200,
-
-        seed=SEED,
-        data_seed=SEED,
-
+        # The Trainer seeds Python, NumPy and PyTorch from these.
+        seed=config.seed,
+        data_seed=config.seed,
         **parallel_args,
     )
 
 
 def main() -> None:
-    set_seed(SEED)
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    config = TrainConfig.from_env()
+    final_model_dir = config.output_dir / "final_model"
 
+    # Resubmitting a finished run would otherwise resume from its last
+    # checkpoint, retrain the tail and overwrite final_model.
+    if final_model_is_complete(final_model_dir):
+        if config.is_main_process:
+            print("Training already finished:", final_model_dir)
+        return
+
+    config.output_dir.mkdir(parents=True, exist_ok=True)
     use_bf16 = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
-
-    # Built first: it starts the distributed process group used below.
-    training_args = build_training_args(use_bf16)
-
-    # Set LOCAL_FILES_ONLY=1 in an offline Slurm job after caching the model once.
-    local_files_only = os.environ.get("LOCAL_FILES_ONLY", "0") == "1"
-    tokenizer = AutoTokenizer.from_pretrained(
-        MODEL_NAME,
-        use_fast=True,
-        local_files_only=local_files_only,
+    device = torch.device(
+        f"cuda:{config.local_rank}" if torch.cuda.is_available() else "cpu"
     )
 
-    tokenized_dataset = load_tokenized_dataset(tokenizer, training_args)
-    if is_main_process():
-        print_configuration(tokenized_dataset, use_bf16)
+    # Built first: it starts the distributed process group used below.
+    training_args = build_training_args(config, use_bf16)
 
-    if PARALLEL_MODE == "fsdp":
+    tokenizer = AutoTokenizer.from_pretrained(
+        config.model_name,
+        use_fast=True,
+        local_files_only=config.local_files_only,
+    )
+    tokenized = load_tokenized_splits(
+        config.data_dir,
+        tokenizer,
+        model_name=config.model_name,
+        prefix=config.prefix,
+        target_max_length=config.target_max_length,
+        cache_dir=config.tokenized_cache_dir,
+        num_proc=config.dataloader_num_workers,
+        is_main_process=config.is_main_process,
+        main_process_first=lambda: training_args.main_process_first(
+            local=False, desc="dataset tokenization"
+        ),
+    )
+    eval_dataset = tokenized["validation"]
+    if 0 < config.eval_max_samples < len(eval_dataset):
+        eval_dataset = eval_dataset.select(range(config.eval_max_samples))
+
+    if config.is_main_process:
+        print_config(config, use_bf16)
+        print("Train rows:", len(tokenized["train"]))
+        print("Validation rows used for eval_loss:", len(eval_dataset))
+        config.write_json(config.output_dir / "run_config.json")
+
+    if config.parallel_mode == "fsdp":
         # Lets from_pretrained see FSDP before the Trainer creates it, so
         # cpu_ram_efficient_loading applies to this load.
         os.environ["ACCELERATE_USE_FSDP"] = "true"
     model = AutoModelForSeq2SeqLM.from_pretrained(
-        MODEL_NAME,
-        local_files_only=local_files_only,
+        config.model_name,
+        local_files_only=config.local_files_only,
     )
-    data_collator = DataCollatorForSeq2Seq(tokenizer=tokenizer, model=model)
+    data_collator = DataCollatorForSeq2Seq(
+        tokenizer=tokenizer,
+        model=model,
+        # Tensor-core friendly shapes; padding is masked, so the loss is unchanged.
+        pad_to_multiple_of=8,
+    )
+
+    callbacks = []
+    stopper = None
+    if config.job_end_time > 0:
+        stopper = StopBeforeTimeLimit(
+            config.job_end_time - 60 * config.stop_margin_minutes, device
+        )
+        callbacks.append(stopper)
 
     trainer = Seq2SeqTrainer(
         model=model,
         args=training_args,
-        train_dataset=tokenized_dataset["train"],
-        eval_dataset=tokenized_dataset["validation"],
+        train_dataset=tokenized["train"],
+        eval_dataset=eval_dataset,
         processing_class=tokenizer,
         data_collator=data_collator,
+        callbacks=callbacks,
     )
 
-    checkpoint = get_last_checkpoint(str(OUTPUT_DIR))
-    if is_main_process():
+    checkpoint = get_last_checkpoint(str(config.output_dir))
+    if config.is_main_process:
         if checkpoint:
             print("Resuming from checkpoint:", checkpoint)
         else:
             print("Starting training from the pretrained model")
 
     train_result = trainer.train(resume_from_checkpoint=checkpoint)
-    if is_main_process():
+
+    if stopper is not None and stopper.stopped:
+        if config.is_main_process:
+            print(
+                "Stopped before the job time limit at step",
+                trainer.state.global_step,
+                "- checkpoint saved; submit again to continue.",
+            )
+        return
+
+    if config.is_main_process:
         trainer.save_metrics("train", train_result.metrics)
         trainer.save_state()
 
-    final_model_dir = OUTPUT_DIR / "final_model"
     if trainer.is_fsdp_enabled:
         # Gather the shards into one Hugging Face model that loads anywhere.
-        trainer.accelerator.state.fsdp_plugin.set_state_dict_type(
-            "FULL_STATE_DICT"
-        )
+        trainer.accelerator.state.fsdp_plugin.set_state_dict_type("FULL_STATE_DICT")
     # Called on every rank: under FSDP all ranks take part in the gather.
     trainer.save_model(str(final_model_dir))
-    if is_main_process():
+    if config.is_main_process:
         tokenizer.save_pretrained(str(final_model_dir))
         print("Final model saved to:", final_model_dir)
         if torch.cuda.is_available():
             print(
                 "Peak GPU memory allocated (GB):",
-                round(torch.cuda.max_memory_allocated(LOCAL_RANK) / 1e9, 1),
+                round(torch.cuda.max_memory_allocated(config.local_rank) / 1e9, 1),
             )
 
-    test_dataset = None
-    if is_main_process():
-        test_dataset = build_split(
-            DATA_DIR / "src-test.txt", DATA_DIR / "tgt-test.txt"
-        )
+    if config.parallel_mode == "none":
+        # The single-GPU run tests the fp32 model it just trained.
+        test_model = model
+    else:
+        # A DDP- or FSDP-wrapped model cannot generate on one rank, so rank 0
+        # reloads the saved model in bf16, as evaluate_exact_match.py does.
+        torch.distributed.barrier()
+        del trainer, model
+        torch.cuda.empty_cache()
+        torch.distributed.destroy_process_group()
+        if not config.is_main_process:
+            return
+        test_model = AutoModelForSeq2SeqLM.from_pretrained(
+            str(final_model_dir),
+            dtype=torch.bfloat16 if use_bf16 else torch.float32,
+        ).to(device)
 
-    if PARALLEL_MODE == "none":
-        print("===== Bounded Generation Test =====")
-        device = next(model.parameters()).device
-        test_metrics = generate_test_metrics(
-            model, tokenizer, test_dataset, device
-        )
-        trainer.save_metrics("test", test_metrics)
-        print(test_metrics)
-        return
-
-    # A DDP- or FSDP-wrapped model cannot generate on one rank, so rank 0
-    # reloads the saved model in bf16, as evaluate_exact_match.py does.
-    torch.distributed.barrier()
-    del trainer, model
-    torch.cuda.empty_cache()
-    torch.distributed.destroy_process_group()
-    if not is_main_process():
-        return
-
+    # Quick check on the first test rows; the official score comes from
+    # evaluate_exact_match.py on the whole split.
     print("===== Bounded Generation Test =====")
-    device = torch.device(
-        f"cuda:{LOCAL_RANK}" if torch.cuda.is_available() else "cpu"
+    test_dataset = load_split(config.data_dir, "test")
+    test_dataset = test_dataset.select(
+        range(min(config.test_sample_size, len(test_dataset)))
     )
-    test_model = AutoModelForSeq2SeqLM.from_pretrained(
-        str(final_model_dir),
-        dtype=torch.bfloat16 if use_bf16 else torch.float32,
-    ).to(device)
-    test_metrics = generate_test_metrics(
-        test_model, tokenizer, test_dataset, device
-    )
-    save_metrics_file("test", test_metrics)
+    test_metrics = {"test_exact_match": 0.0, "test_samples": 0}
+    if len(test_dataset):
+        matches = run_evaluation(
+            test_model,
+            tokenizer,
+            test_dataset,
+            device=device,
+            prefix=config.prefix,
+            batch_size=config.generation_batch_size,
+            max_new_tokens=config.generation_max_new_tokens,
+            # Dataset order keeps the number comparable with earlier runs.
+            sort_by_length=False,
+        )
+        test_metrics = {
+            "test_exact_match": matches[0] / len(test_dataset),
+            "test_samples": len(test_dataset),
+        }
+    save_metrics_file(config.output_dir, "test", test_metrics)
     print(test_metrics)
 
 
