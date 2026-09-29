@@ -5,9 +5,9 @@ This repository contains training and evaluation code for predicting molecular S
 ## Repository contents
 
 - `t5_train.py`: shared training pipeline.
-- `start_training_*.sh`: Slurm configurations for different model sizes, input lengths, batch sizes, and epoch counts.
+- `start_training_<model>_<batch>x<accumulation>_<epochs>.sh`: Slurm configurations for different model sizes, batch sizes, and epoch counts. Inputs are truncated to 1,536 tokens.
 - `evaluate_exact_match.py`: exact-match evaluation program.
-- `evaluate_*.sh`: Slurm array jobs for model evaluation.
+- `evaluate_<model>_<batch>x<accumulation>_<epochs>_array.sh`: Slurm array jobs that evaluate the matching training run.
 - `evaluate_check.sh`: 10-sample evaluation smoke test.
 - `test_gpu.sh`: checks that PyTorch can see the GPU on a cluster node.
 - `reports/`: chunk-level and aggregated exact-match results.
@@ -37,7 +37,7 @@ See `data/README.md` and `data/manifest.tsv` for split structure and integrity c
 
 Submit one training configuration through Slurm, for example:
 
-    sbatch start_training_xl_1536_4x4_10ep.sh
+    sbatch start_training_xl_4x4_10ep.sh
 
 Generated checkpoints are written under `outputs/` or `results*/` and are intentionally excluded from Git.
 
@@ -45,7 +45,7 @@ Generated checkpoints are written under `outputs/` or `results*/` and are intent
 
 Submit the corresponding evaluation array, for example:
 
-    sbatch evaluate_xl_1536_10ep_array.sh
+    sbatch evaluate_xl_4x4_10ep_array.sh
 
 Raw Slurm logs are excluded from Git. Compact exact-match summaries are available in `reports/evaluation_summary.tsv`.
 

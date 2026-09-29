@@ -1,7 +1,7 @@
 #!/bin/bash
 
 #SBATCH --output=logs/%x_%j.out
-#SBATCH --job-name=flan_t5_large_1536_10ep
+#SBATCH --job-name=flan_t5_xl_1x16_3ep
 #SBATCH --partition=workq
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
@@ -23,20 +23,19 @@ cd "$SLURM_SUBMIT_DIR"
 
 # ===== Experiment configuration =====
 
-export MODEL_NAME="google/flan-t5-large"
-export INPUT_MAX_LENGTH=1536
+export MODEL_NAME="google/flan-t5-xl"
 export TARGET_MAX_LENGTH=128
 
-export TRAIN_BATCH_SIZE=4
-export GRAD_ACCUMULATION_STEPS=4
+export TRAIN_BATCH_SIZE=1
+export GRAD_ACCUMULATION_STEPS=16
 
 # 4 × 4 × 1 GPU = effective batch size 16.
-export EVAL_BATCH_SIZE=8
-export GENERATION_BATCH_SIZE=8
+export EVAL_BATCH_SIZE=2
+export GENERATION_BATCH_SIZE=2
 
 export LEARNING_RATE="5e-5"
 export WEIGHT_DECAY="0.01"
-export NUM_EPOCHS=10
+export NUM_EPOCHS=3
 export SEED=42
 
 export SAVE_STEPS=2000
@@ -49,7 +48,8 @@ export TEST_SAMPLE_SIZE=1000
 export GENERATION_MAX_NEW_TOKENS=128
 
 # Explicit output directory prevents accidental checkpoint reuse.
-export OUTPUT_DIR="$SLURM_SUBMIT_DIR/outputs/flan-t5-large_nmr_input1536_bs4x4_10ep"
+export OUTPUT_DIR="$SLURM_SUBMIT_DIR/outputs/flan-t5-xl_nmr_input1536_bs16_gc"
+
 
 # ===== Slurm information =====
 
@@ -87,7 +87,6 @@ nvidia-smi
 
 echo "===== Shell Training Configuration ====="
 echo "Model: $MODEL_NAME"
-echo "Input max length: $INPUT_MAX_LENGTH"
 echo "Train batch size per device: $TRAIN_BATCH_SIZE"
 echo "Gradient accumulation steps: $GRAD_ACCUMULATION_STEPS"
 echo "Effective batch size: $((TRAIN_BATCH_SIZE * GRAD_ACCUMULATION_STEPS))"

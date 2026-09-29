@@ -21,12 +21,11 @@ conda activate t5
 nvidia-smi
 
 python evaluate_exact_match.py \
-  --model-path outputs/flan-t5-xl_nmr_input1024_bs16/final_model \
+  --model-path outputs/flan-t5-xl_nmr_input1536_4x4_ep10/final_model \
   --data-dir alberts_2d \
   --split test \
-  --input-max-length 1024 \
   --batch-size 2 \
   --start-index 0 \
   --sample-size 10 \
-  --output-file outputs/flan-t5-xl_nmr_input1024_bs16/test_check.json \
+  --output-file outputs/flan-t5-xl_nmr_input1536_4x4_ep10/test_check.json \
   --local-files-only
