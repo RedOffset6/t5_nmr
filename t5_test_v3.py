@@ -120,11 +120,11 @@ def report_length_statistics(
     sample_size: int = 10000,
     batch_size: int = 256,
 ) -> None:
-    """统计未经截断的输入token长度。"""
+    """Report input token lengths before truncation."""
 
     sample_size = min(sample_size, len(dataset))
 
-    # 固定随机种子抽样，保证不同实验统计相同的样本。
+    # Sample with a fixed seed so every experiment measures the same examples.
     sample = (
         dataset.shuffle(seed=SEED)
         .select(range(sample_size))

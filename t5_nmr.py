@@ -82,7 +82,7 @@ model = T5ForConditionalGeneration.from_pretrained(MODEL_NAME)
 data_collator = DataCollatorForSeq2Seq(tokenizer=tokenizer, model=model)
 
 
-#读取数据 Read Data
+# Read data
 
 
 def read_lines(path):
@@ -182,15 +182,15 @@ metric = evaluate.load("rouge")
 def compute_metrics(eval_preds):
     preds, labels = eval_preds
 
-    # 某些 Trainer 会将 predictions 包装在 tuple 中
+    # Some Trainer versions wrap predictions in a tuple.
     if isinstance(preds, tuple):
         preds = preds[0]
 
     preds = np.asarray(preds)
     labels = np.asarray(labels)
 
-    # 防御性处理：
-    # 如果返回的是 logits，转换为 token IDs
+    # Defensive handling:
+    # if logits are returned, convert them to token IDs.
     # logits shape: (batch, sequence_length, vocab_size)
     if preds.ndim == 3:
         preds = np.argmax(preds, axis=-1)
@@ -200,18 +200,18 @@ def compute_metrics(eval_preds):
     if pad_token_id is None:
         pad_token_id = 0
 
-    # 转换为 tokenizer 可以安全处理的整数类型
+    # Cast to an integer type the tokenizer can safely handle.
     preds = preds.astype(np.int64)
     labels = labels.astype(np.int64)
 
-    # 清理预测结果中的非法 token IDs
+    # Replace invalid token IDs in the predictions.
     preds = np.where(
         (preds >= 0) & (preds < tokenizer.vocab_size),
         preds,
         pad_token_id
     )
 
-    # -100 是损失函数使用的忽略标记，不能直接交给 tokenizer 解码
+    # -100 is the ignore index used by the loss and cannot be decoded by the tokenizer.
     labels = np.where(
         labels != -100,
         labels,

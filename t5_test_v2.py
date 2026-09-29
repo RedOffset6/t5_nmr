@@ -113,11 +113,11 @@ def report_length_statistics(
     sample_size: int = 10000,
     batch_size: int = 256,
 ) -> None:
-    """统计输入长度以及在256/512 token处的截断比例。"""
+    """Report input lengths and the fraction truncated at 256/512 tokens."""
 
     sample_size = min(sample_size, len(dataset))
 
-    # 固定种子随机抽样，避免只统计数据集开头部分。
+    # Sample randomly with a fixed seed rather than only the start of the dataset.
     sample = (
         dataset.shuffle(seed=SEED)
         .select(range(sample_size))
