@@ -6,6 +6,7 @@ documented in the README.
 """
 
 import json
+import math
 import os
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -15,7 +16,8 @@ from nmr_data import DEFAULT_PREFIX
 
 BASE_DIR = Path(__file__).resolve().parent
 
-PARALLEL_MODES = ("none", "ddp", "fsdp")
+PARALLEL_MODES = ("none", "ddp", "fsdp", "hsdp")
+LR_SCALINGS = ("none", "sqrt", "linear")
 
 
 def env_str(name: str, default: str) -> str:
@@ -49,7 +51,12 @@ class TrainConfig:
     seed: int
 
     # ===== Optimisation (keep identical across runs to compare results) =====
+    # LEARNING_RATE is the rate for a global batch of base_batch; with
+    # lr_scaling it is scaled to the actual global batch (effective_learning_rate).
     learning_rate: float
+    lr_scaling: str
+    base_batch: int
+    warmup_ratio: float
     weight_decay: float
     train_batch_size: int
     grad_accumulation_steps: int
@@ -76,6 +83,7 @@ class TrainConfig:
 
     # ===== Distributed training (set by torchrun) =====
     parallel_mode: str
+    gpus_per_node: int
     world_size: int
     rank: int
     local_rank: int
@@ -92,11 +100,20 @@ class TrainConfig:
                 str(BASE_DIR / "outputs" / f"{model_name.split('/')[-1]}_nmr"),
             )
         )
-        train_batch_size = env_int("TRAIN_BATCH_SIZE", 16)
+        # PER_GPU_BATCH is the newer name; TRAIN_BATCH_SIZE is kept for the
+        # configs written before it.
+        per_gpu = os.environ.get("PER_GPU_BATCH")
+        legacy = os.environ.get("TRAIN_BATCH_SIZE")
+        if per_gpu and legacy and int(per_gpu) != int(legacy):
+            raise ValueError(
+                f"PER_GPU_BATCH={per_gpu} and TRAIN_BATCH_SIZE={legacy} disagree; set one"
+            )
+        train_batch_size = int(per_gpu or legacy or 16)
         world_size = env_int("WORLD_SIZE", 1)
 
         # none: one process, one GPU. ddp: every GPU holds the full model.
-        # fsdp: parameters, gradients and optimizer state are sharded.
+        # fsdp: parameters, gradients and optimizer state are sharded over
+        # all GPUs. hsdp: sharded within each node, replicated across nodes.
         parallel_mode = env_str(
             "PARALLEL_MODE", "ddp" if world_size > 1 else "none"
         ).strip().lower()
@@ -110,6 +127,12 @@ class TrainConfig:
                 "use PARALLEL_MODE=none with plain python, ddp or fsdp with torchrun."
             )
 
+        lr_scaling = env_str("LR_SCALING", "none").strip().lower()
+        if lr_scaling not in LR_SCALINGS:
+            raise ValueError(
+                f"LR_SCALING must be one of {LR_SCALINGS}, got {lr_scaling!r}"
+            )
+
         return cls(
             model_name=model_name,
             data_dir=Path(env_str("DATA_DIR", str(BASE_DIR / "alberts_2d"))),
@@ -121,6 +144,11 @@ class TrainConfig:
             target_max_length=env_int("TARGET_MAX_LENGTH", 128),
             seed=env_int("SEED", 42),
             learning_rate=env_float("LEARNING_RATE", 5e-5),
+            lr_scaling=lr_scaling,
+            # The global batch the earlier results were trained with.
+            base_batch=env_int("BASE_BATCH", 16),
+            # Share of training spent warming the learning rate up from 0.
+            warmup_ratio=env_float("WARMUP_RATIO", 0),
             weight_decay=env_float("WEIGHT_DECAY", 0.01),
             train_batch_size=train_batch_size,
             grad_accumulation_steps=env_int("GRAD_ACCUMULATION_STEPS", 1),
@@ -148,6 +176,7 @@ class TrainConfig:
             generation_batch_size=env_int("GENERATION_BATCH_SIZE", 32),
             generation_max_new_tokens=env_int("GENERATION_MAX_NEW_TOKENS", 128),
             parallel_mode=parallel_mode,
+            gpus_per_node=env_int("GPUS_PER_NODE", 1),
             world_size=world_size,
             rank=env_int("RANK", 0),
             local_rank=env_int("LOCAL_RANK", 0),
@@ -163,9 +192,20 @@ class TrainConfig:
         # One training process per GPU, so WORLD_SIZE is the number of GPUs.
         return self.train_batch_size * self.grad_accumulation_steps * self.world_size
 
+    @property
+    def effective_learning_rate(self) -> float:
+        """LEARNING_RATE scaled from base_batch to the actual global batch."""
+        ratio = self.global_batch_size / self.base_batch
+        if self.lr_scaling == "linear":
+            return self.learning_rate * ratio
+        if self.lr_scaling == "sqrt":
+            return self.learning_rate * math.sqrt(ratio)
+        return self.learning_rate
+
     def to_dict(self) -> dict:
         values = asdict(self)
         values["global_batch_size"] = self.global_batch_size
+        values["effective_learning_rate"] = self.effective_learning_rate
         return {
             key: str(value) if isinstance(value, Path) else value
             for key, value in values.items()

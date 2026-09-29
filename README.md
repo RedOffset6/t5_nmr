@@ -125,19 +125,19 @@ Each file in `configs/train/` is one run. It holds only the settings that differ
     PARALLEL_MODE=fsdp
     GPUS_PER_NODE=4
 
-Run names are `<model>_<batch>x<accumulation>[x<gpus>]_<epochs>ep`. For example, `xxl_2x2x4_10ep` trains FLAN-T5-XXL with 2 examples per GPU per step, 2 steps of gradient accumulation and 4 GPUs (2 × 2 × 4 = 16 examples per update) for 10 epochs. Single-GPU runs leave out the GPU count: `xl_4x4_10ep` means 4 × 4 on one GPU.
+Run names are `<model>_<batch>x<accumulation>[x<gpus>]_<epochs>ep`. For example, `xxl_2x2x4_10ep` trains FLAN-T5-XXL with 2 examples per GPU per step, 2 steps of gradient accumulation and 4 GPUs (2 × 2 × 4 = 16 examples per update) for 10 epochs. Single-GPU runs leave out the GPU count: `xl_4x4_10ep` means 4 × 4 on one GPU. Multi-node runs, whose global batch depends on the number of nodes, are named by their per-GPU batch instead: `xl_pg4_10ep` has 4 examples per GPU (see [Multi-node training](#multi-node-training)).
 
-| Model | Parameters | 1 GPU | 4 GPUs (1 node) | 8 GPUs (2 nodes) |
+| Model | Parameters | 1 GPU | 4 GPUs (1 node) | Several nodes |
 |---|---|---|---|---|
 | small | 80M | `small_4x4_3ep` | `small_4x1x4_3ep` | |
-| base | 250M | `base_16x1_3ep` | | |
+| base | 250M | `base_16x1_3ep`, `base_scaling_gb16` | | `base_scaling_gb128_sqrt`, `base_scaling_gb128_linear` |
 | large | 780M | `large_4x4_3ep`, `large_4x4_10ep` | `large_4x1x4_10ep` | |
-| xl | 3B | `xl_4x4_3ep`, `xl_1x16_3ep`, `xl_4x4_10ep`, `xl_1x16_10ep`, `xl_2x8_10ep` | `xl_4x1x4_10ep` | |
-| xxl | 11B | (can't fit, see [Multi-GPU training](#multi-gpu-training)) | `xxl_2x2x4_10ep`, `xxl_1x4x4_10ep` | `xxl_2x1x8_10ep` |
+| xl | 3B | `xl_4x4_3ep`, `xl_1x16_3ep`, `xl_4x4_10ep`, `xl_1x16_10ep`, `xl_2x8_10ep` | `xl_4x1x4_10ep` | `xl_pg4_10ep` |
+| xxl | 11B | (can't fit, see [Multi-GPU training](#multi-gpu-training)) | `xxl_2x2x4_10ep`, `xxl_1x4x4_10ep` | `xxl_2x1x8_10ep`, `xxl_pg2_10ep` |
 
-Every run updates the model with 16 examples at a time: batch per GPU × accumulation steps × number of GPUs = 16. This keeps new runs comparable with the 88.2% XL result. Runs with a smaller batch per step, such as 1×16, use less GPU memory but train more slowly.
+The runs in the first two GPU columns update the model with 16 examples at a time: batch per GPU × accumulation steps × number of GPUs = 16. This keeps them comparable with the 88.2% XL result. Runs with a smaller batch per step, such as 1×16, use less GPU memory but train more slowly. The multi-node runs use larger global batches with a scaled learning rate, which is a different recipe; see [Multi-node training](#multi-node-training).
 
-To add a run, copy a config under a new name. Its output folder is `outputs/<run>`.
+To add a run, copy a config under a new name, or start from `configs/template.env`, which lists every setting at its default. The run's output folder is `outputs/<run>`.
 
 `probe_xl_4x4_nogc` is not a real run. It trains XL for 200 steps without gradient checkpointing and prints the peak GPU memory, to find out whether single-GPU XL runs need gradient checkpointing at all.
 
@@ -161,7 +161,7 @@ The single-GPU XXL scripts (`xxl_4x4_10ep`, `xxl_2x8_10ep`, `xxl_1x16_10ep`) wer
 
 ### Variables
 
-A config sets any of these. Variables that a config doesn't set can also be given at submission, as in `MAX_STEPS=50 ./submit.sh train <run>`; when both set a variable, the config wins.
+A config sets any of these. Variables that a config doesn't set can also be given at submission, as in `MAX_STEPS=50 ./submit.sh train <run>`; when both set a variable, the config wins. The exceptions are `OUTPUT_DIR`, which comes only from the config or the run name, and `NODES`/`GPUS_PER_NODE`, which `--nodes` and `--gpus` override.
 
 **Training** (read by `t5_train.py` through `config.py`):
 
@@ -170,18 +170,21 @@ A config sets any of these. Variables that a config doesn't set can also be give
 | `MODEL_NAME` | `google/flan-t5-base` | Hugging Face model to fine-tune |
 | `DATA_DIR` | `/projects/b5an/alberts_2d` (from `slurm/env.sh`) | Folder with the `src-*`/`tgt-*` files. A relative path is relative to the repository |
 | `OUTPUT_DIR` | `outputs/<run>` | Where checkpoints and the final model go |
-| `TRAIN_BATCH_SIZE` | 16 | Examples per GPU per step |
+| `PER_GPU_BATCH` | 16 | Examples per GPU per step. Older configs call it `TRAIN_BATCH_SIZE`, which still works |
 | `GRAD_ACCUMULATION_STEPS` | 1 | Steps combined into each model update |
 | `NUM_EPOCHS` | 3 | Passes over the training data |
 | `MAX_STEPS` | 0 | Stop after this many model updates, for smoke tests. 0 trains for `NUM_EPOCHS` |
-| `LEARNING_RATE` | 5e-5 | Optimizer learning rate |
+| `LEARNING_RATE` | 5e-5 | Learning rate for a global batch of `BASE_BATCH` |
+| `BASE_BATCH` | 16 | The global batch `LEARNING_RATE` belongs to |
+| `LR_SCALING` | `none` | How the learning rate follows a larger global batch: `none`, `sqrt` or `linear` (see [Multi-node training](#multi-node-training)) |
+| `WARMUP_RATIO` | 0 | Share of training spent raising the learning rate from 0, for example 0.03 |
 | `WEIGHT_DECAY` | 0.01 | Optimizer weight decay |
 | `GRADIENT_CHECKPOINTING` | 0 | 1 trades speed for lower GPU memory |
 | `TARGET_MAX_LENGTH` | 128 | SMILES strings longer than this many tokens are cut off |
-| `EVAL_BATCH_SIZE` | 4 × `TRAIN_BATCH_SIZE` | Batch size for validation loss |
+| `EVAL_BATCH_SIZE` | 4 × `PER_GPU_BATCH` | Batch size for validation loss |
 | `EVAL_MAX_SAMPLES` | 5000 | Validation molecules (the first ones) used for validation loss; 0 uses all 35,749 |
 | `GROUP_BY_LENGTH` | 0 | 1 batches spectra of similar length together (see [Performance](#performance-and-comparability)) |
-| `DATALOADER_NUM_WORKERS` | 4 | Worker processes per GPU that prepare batches; also used to tokenize the data |
+| `DATALOADER_NUM_WORKERS` | 4 on 1 GPU, 8 on several | Worker processes per GPU that prepare batches; also used to tokenize the data |
 | `SAVE_STEPS` / `SAVE_TOTAL_LIMIT` | 2000 / 2 | Checkpoint frequency and how many to keep |
 | `STOP_MARGIN_MINUTES` | 20 | Save and stop this long before the job's time limit |
 | `TEST_SAMPLE_SIZE` | 1000 | Test molecules in the quick end-of-training check |
@@ -189,7 +192,7 @@ A config sets any of these. Variables that a config doesn't set can also be give
 | `GENERATION_MAX_NEW_TOKENS` | 128 | Longest SMILES the quick check and the evaluation can generate |
 | `SEED` | 42 | Random seed |
 | `LOCAL_FILES_ONLY` | 0 | Set to 1 on offline nodes after the model is downloaded once |
-| `PARALLEL_MODE` | `none`, or `ddp` on several GPUs | `none`: one GPU. `ddp`: every GPU holds a full copy of the model. `fsdp`: the model is split across GPUs. See [Multi-GPU training](#multi-gpu-training) |
+| `PARALLEL_MODE` | `none`, or `ddp` on several GPUs | `none`, `ddp`, `fsdp` or `hsdp`; see [Which mode to use](#which-mode-to-use) |
 | `TOKENIZED_CACHE_DIR` | `<OUTPUT_DIR>/tokenized` | Where the tokenized dataset is cached. It is rebuilt when the model, prefix, `TARGET_MAX_LENGTH` or `DATA_DIR` changes |
 
 NMR inputs are never truncated. T5 has no fixed maximum input length, so the whole spectrum is always used. Very long inputs use a lot of GPU memory; if a job runs out of memory, use a configuration with a smaller batch per step.
@@ -198,11 +201,12 @@ NMR inputs are never truncated. T5 has no fixed maximum input length, so the who
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `NODES` / `GPUS_PER_NODE` | 1 / 1 | GPUs to train on. More than one GPU starts `torchrun` |
+| `NODES` / `GPUS_PER_NODE` | 1 / 1 | GPUs to train on; `--nodes` and `--gpus` on `submit.sh` override them. More than one GPU starts one training process per GPU |
 | `TRAIN_TIME` | `1-00:00:00` | Time limit of each training job |
 | `TRAIN_MEM` | `64G` on 1 GPU, whole node otherwise | Host memory of a training job |
 | `MAX_RESUBMITS` | 20 | How many times an unfinished run submits itself again |
 | `EVAL_CHUNKS` | 4 | Evaluation array tasks, one GPU each |
+| `EVAL_MAX_ROWS` | 0 | Evaluate only the first rows of the split, for example 20000; 0 evaluates all of it |
 | `EVAL_TIME` / `EVAL_MEM` | `10:00:00` / `64G` | Time limit and host memory of each evaluation chunk |
 | `EVAL_GENERATION_BATCH_SIZE` | 16 | Spectra per `generate` call in the evaluation |
 | `NUM_OUTPUTS` | 10 | Candidate SMILES per spectrum in the evaluation |
@@ -212,37 +216,93 @@ Other `sbatch` options can be added after the run name, for example `./submit.sh
 
 ## Multi-GPU training
 
-An Isambard-AI node has 4 GH200 GPUs, each with 96 GB of memory, connected by NVLink. A run with `GPUS_PER_NODE=4` starts one training process per GPU with `torchrun` and requests all 4 GPUs, so the job never shares a node.
+An Isambard-AI node has 4 GH200 superchips. Each is one 96 GB GPU with its own 72-core Grace CPU and 120 GB of memory, and the 4 GPUs of a node are connected by NVLink. A run on several GPUs starts **one Slurm task per GPU**, as the Isambard-AI documentation recommends: `--ntasks-per-node` and `--gpus-per-node` equal to the GPUs per node, and `--cpus-per-task=72`. Slurm pins each task to the Grace CPU attached to its GPU, and each task runs one copy of `t5_train.py`. The Trainer connects the copies with NCCL from the `RANK`, `LOCAL_RANK` and `WORLD_SIZE` variables that `slurm/train.sbatch` sets.
 
 **Why XXL needs several GPUs.** Full fine-tuning with the AdamW optimizer in mixed precision keeps about 16 bytes per parameter on the GPU: fp32 weights (4), fp32 gradients (4) and two optimizer moments (8). This is before counting activations, the intermediate results kept for the backward pass.
 
 | Model | Training state | 1 GPU | Split over 4 GPUs | Split over 8 GPUs |
 |---|---|---|---|---|
 | large (0.78B) | ~12 GB | fits | – | – |
-| xl (2.85B) | ~46 GB | fits only with gradient checkpointing | ~12 GB | ~6 GB |
+| xl (2.85B) | ~46 GB | fits | ~12 GB | ~6 GB |
 | xxl (11.3B) | ~180 GB | never fits | ~45 GB | ~23 GB |
 
 No batch size or gradient checkpointing setting makes XXL fit on one 96 GB GPU.
 
-**Which mode to use:**
+### Which mode to use
 
-- `ddp` (data parallel), for small, base and large: every GPU holds a full copy of the model and processes different examples. The GPUs average their gradients after each step. Training is about 4 times faster than on one GPU.
-- `fsdp` (fully sharded data parallel), for xl and xxl: the weights, gradients and optimizer state are split across the GPUs. Each GPU briefly gathers one T5 block's weights when it needs them. This is the same optimization as a single-GPU run, just spread over more memory. XL no longer needs gradient checkpointing. XXL still uses it to leave room for activations.
+| Model | Mode | What it does |
+|---|---|---|
+| small, base, large, xl | `ddp` | Every GPU holds a full copy of the model and processes different examples. The GPUs average their gradients after each step: the only communication, so this also works well between nodes. |
+| xxl, 1 node | `fsdp` | The weights, gradients and optimizer state are split over the 4 GPUs. Each GPU briefly gathers one T5 block's weights when it needs them, over NVLink. |
+| xxl, 2 or more nodes | `hsdp` | Split over the 4 GPUs of each node, as `fsdp`, and copied across nodes, as `ddp`. Only a gradient average crosses the network, instead of gathering 45 GB of weights over it every step. |
 
-If `xxl_2x2x4_10ep` runs out of GPU memory, use `xxl_1x4x4_10ep`, or `xxl_2x1x8_10ep` on two nodes.
+All three are the same optimization as a single-GPU run for the same global batch. XL fits on one GPU (46 GB of training state), so it uses `ddp`; without gradient checkpointing it needs more memory for activations, which `probe_xl_4x4_nogc` measures. XXL uses gradient checkpointing to leave room for activations.
 
-**Checkpoints.** An FSDP checkpoint is stored as one shard per GPU. A job can therefore only resume from a checkpoint written with the same `PARALLEL_MODE` and the same number of GPUs, and a checkpoint from a single-GPU run can't be resumed on 4 GPUs. The final model is gathered into a normal Hugging Face model in `final_model/`, which loads on any number of GPUs. For XXL, each checkpoint takes about 135 GB, because it includes the optimizer state. With `SAVE_TOTAL_LIMIT=2` and the 45 GB final model, one XXL run needs about 315 GB of project storage.
+`hsdp` needs every task to see all 4 GPUs of its node. `./submit.sh test-multi-gpu` reports what each task sees; if it prints `sees 1 GPU(s)`, use `fsdp` on one node instead.
 
-**Host memory.** Multi-GPU jobs request the whole node's memory (`--mem=0`) and all its CPU cores (72 per GPU, `CPUS_PER_GPU` in `slurm/env.sh`). Rank 0 loads the fp32 XXL weights (45 GB) and gathers the full model when saving, and the other processes wait. The tokenized dataset is memory-mapped, so all processes on a node share one copy. If your partition doesn't allow `--mem=0`, set `TRAIN_MEM=360G`.
+If `xxl_2x2x4_10ep` runs out of GPU memory, use `xxl_1x4x4_10ep`.
 
-**Two nodes.** Within a node, GPUs communicate over NVLink with no extra setup. Between nodes, NCCL needs the aws-ofi-nccl plugin to use the Slingshot network. When `NODES` is more than 1, the job calls `setup_multinode_nccl` from `slurm/env.sh`. This loads `brics/nccl` and `brics/aws-ofi-nccl` and sets the variables from the [Isambard-AI NCCL guide](https://docs.isambard.ac.uk/user-documentation/guides/nccl/). Run `./submit.sh test-multi-gpu --nodes=2` first. With `NCCL_DEBUG=INFO`, the log should show `NET/AWS Libfabric`. If it shows `NET/Socket`, NCCL has fallen back to TCP, which works but is slow.
+**Checkpoints.** A job can only resume a checkpoint written with the same number of GPUs, `PARALLEL_MODE`, global batch and learning rate. `run_config.json` records them, and a job that doesn't match stops with a message saying what differs. An FSDP or HSDP checkpoint is stored as one shard per GPU. The final model is gathered into a normal Hugging Face model in `final_model/`, which loads on any number of GPUs. For XXL, each checkpoint takes about 135 GB, because it includes the optimizer state. With `SAVE_TOTAL_LIMIT=2` and the 45 GB final model, one XXL run needs about 315 GB of project storage.
 
-**Checking a new setup**, in order:
+**Host memory.** Multi-GPU jobs request the whole node's memory (`--mem=0`). Rank 0 loads the fp32 XXL weights (45 GB) and gathers the full model when saving, and the other processes wait. The tokenized dataset is memory-mapped, so all processes on a node share one copy. If your partition doesn't allow `--mem=0`, set `TRAIN_MEM=360G`.
 
-1. `./submit.sh test-multi-gpu`: all 4 ranks print their GPU, and rank 0 prints `all_reduce OK` and the bandwidth.
-2. `MAX_STEPS=200 ./submit.sh train small_4x1x4_3ep` and `MAX_STEPS=200 ./submit.sh train small_4x4_3ep`, then compare their training losses. They should track closely, but not exactly, because the examples are processed in a different order.
-3. `MAX_STEPS=100 ./submit.sh train xl_4x1x4_10ep`: cancel it after its first checkpoint and submit it again, to check that an FSDP job can save and resume.
-4. `MAX_STEPS=50 ./submit.sh train xxl_2x2x4_10ep`: at the end, rank 0 prints `Peak GPU memory allocated (GB)`.
+**Between nodes.** Within a node, GPUs communicate over NVLink with no extra setup. Between nodes, NCCL needs the aws-ofi-nccl plugin to use the Slingshot network. When `NODES` is more than 1, the job calls `setup_multinode_nccl` from `slurm/env.sh`. This loads `brics/nccl` and `brics/aws-ofi-nccl` and sets the variables from the [Isambard-AI NCCL guide](https://docs.isambard.ac.uk/user-documentation/guides/nccl/). Run `./submit.sh test-multi-gpu --nodes=2` first. The log should show `NET/AWS Libfabric`. If it shows `NET/Socket`, NCCL has fallen back to TCP, which works but is slow: fix that before using more than 2 nodes.
+
+## Multi-node training
+
+More GPUs only shorten a run if each step does more work. With the global batch fixed at 16, a 10-epoch XL run is always about 424,000 optimizer steps, and 16 examples can't usefully be split over more than 4–8 GPUs. So multi-node runs grow the global batch with the GPUs, `PER_GPU_BATCH` × GPUs, and take proportionally fewer steps:
+
+| Nodes × GPUs | Per-GPU batch | Global batch | Optimizer steps (10 XL epochs) |
+|---|---|---|---|
+| 1 × 1 (as before) | 4 (× 4 accumulation) | 16 | 424k |
+| 1 × 4 | 4 | 16 | 424k |
+| 4 × 4 | 4 | 64 | 106k |
+| 16 × 4 | 4 | 256 | 26k |
+
+A larger batch needs a larger learning rate to make the same progress per example. `LEARNING_RATE` stays the value for a global batch of 16 (`BASE_BATCH`), and `LR_SCALING` scales it to the actual global batch:
+
+- `sqrt`: × √(global / 16). At a global batch of 256 this gives 2e-4.
+- `linear`: × global / 16. At 256 this gives 8e-4.
+
+`WARMUP_RATIO=0.03` raises the learning rate from 0 over the first 3% of training, which large learning rates usually need. `run_config.json` records both the base and the effective learning rate. This is a different recipe from the earlier runs, so it is validated once before it's used for XL or XXL.
+
+A multi-node config fixes the per-GPU batch, and the number of nodes comes from the command line:
+
+    ./submit.sh train xl_pg4_10ep --nodes 4
+
+This writes to `outputs/xl_pg4_10ep_gb64`: the folder name records the global batch, so different node counts never share checkpoints. `evaluate` and `check` need the same `--nodes` to find it.
+
+**Step 1: validate the recipe** on FLAN-T5-base, which takes a few GPU-hours:
+
+    ./submit.sh train base_scaling_gb16             # reference: global batch 16, 1 GPU
+    ./submit.sh train base_scaling_gb128_sqrt       # global batch 128 on 2 nodes, sqrt scaling
+    ./submit.sh train base_scaling_gb128_linear     # the same with linear scaling
+
+Then compare them on the first 20,000 test molecules:
+
+    EVAL_MAX_ROWS=20000 ./submit.sh evaluate base_scaling_gb16
+    python scripts/combine_results.py base_scaling_gb16 --total 20000
+
+Repeat for the other two runs. Accept a scaled recipe if its top-1 exact match is within about 0.5% of the reference. If neither is, try a global batch of 64. Then set `LR_SCALING` in `xl_pg4_10ep` and `xxl_pg2_10ep` to the recipe that passed.
+
+**Step 2: find how many nodes are worth it.** Run 100 steps on 1, 2, 4 and 8 nodes:
+
+    for n in 1 2 4 8; do MAX_STEPS=100 ./submit.sh train xl_pg4_10ep --nodes $n; done
+    python scripts/scaling_table.py 'outputs/xl_pg4_10ep_gb*_max100steps' --project-examples 6792130
+
+The table shows samples per second, the efficiency per GPU compared with one node, and the hours for 10 epochs. Use the largest node count whose efficiency stays above about 80%, and record the table here.
+
+**Step 3: XXL.** `MAX_STEPS=50 ./submit.sh train xxl_pg2_10ep` runs 50 steps on 2 nodes with `hsdp` and prints the peak GPU memory. Cancel it after a checkpoint and submit again to check it resumes. Then submit the real run with the node count from step 2.
+
+### Checking a new setup
+
+In order:
+
+1. `./submit.sh test-multi-gpu`: all 4 ranks print their GPU, which GPUs they see and their CPUs, and rank 0 prints `all_reduce OK` and the bandwidth.
+2. `./submit.sh test-multi-gpu --nodes=2`: the same over 8 ranks, and `NET/AWS Libfabric` in the log.
+3. `MAX_STEPS=200 ./submit.sh train small_4x1x4_3ep` and `MAX_STEPS=200 ./submit.sh train small_4x4_3ep`, then compare `train_loss` in their `train_results.json`. They should be close, but not identical, because the examples are processed in a different order.
+4. `MAX_STEPS=100 SAVE_STEPS=50 ./submit.sh train xl_4x1x4_10ep`: cancel it once `checkpoint-50` exists and submit it again, to check a multi-GPU job can save and resume. `scancel --signal=USR1 <jobid>` instead of a plain cancel makes it save and stop cleanly, as it does before the time limit.
+5. `MAX_STEPS=50 ./submit.sh train xxl_2x2x4_10ep`: at the end, rank 0 prints `Peak GPU memory allocated (GB)`.
 
 ## Performance and comparability
 
@@ -301,10 +361,12 @@ GitHub Actions runs both on every push (`.github/workflows/smoke.yml`). `python 
     evaluate_exact_match.py      evaluation program (also used for the quick test)
     submit.sh                    submits training, evaluation and check jobs
     configs/train/*.env          one file per run
+    configs/template.env         every setting at its default
     slurm/env.sh                 cluster-specific settings
     slurm/*.sbatch               Slurm job templates
     scripts/combine_results.py   combines evaluation chunks
     scripts/dataset_stats.py     token-length and tokenizer statistics
+    scripts/scaling_table.py     throughput and scaling efficiency across node counts
     tests/                       unit and smoke tests
     requirements.txt             packages the code uses
     environment.yml              Conda environment

@@ -96,3 +96,46 @@ def test_split_size_read_from_results(tmp_path):
         chunk["split_size"] = 10
     args = argparse.Namespace(total=None, data_dir=None, run="unused", split="test")
     assert split_total(args, chunks) == 10
+
+
+def make_config(monkeypatch, **env):
+    from config import TrainConfig
+
+    for name in ("WORLD_SIZE", "PARALLEL_MODE", "TRAIN_BATCH_SIZE", "PER_GPU_BATCH"):
+        monkeypatch.delenv(name, raising=False)
+    for name, value in env.items():
+        monkeypatch.setenv(name, str(value))
+    return TrainConfig.from_env()
+
+
+@pytest.mark.parametrize(
+    "scaling, expected",
+    [("none", 5e-5), ("sqrt", 5e-5 * 4), ("linear", 5e-5 * 16)],
+)
+def test_learning_rate_scales_with_global_batch(monkeypatch, scaling, expected):
+    # 4 per GPU x 64 GPUs = global batch 256, 16x the base batch.
+    config = make_config(
+        monkeypatch, PER_GPU_BATCH=4, WORLD_SIZE=64, PARALLEL_MODE="ddp", LR_SCALING=scaling
+    )
+    assert config.global_batch_size == 256
+    assert config.effective_learning_rate == pytest.approx(expected)
+
+
+def test_resume_refused_with_different_gpu_count(monkeypatch, tmp_path):
+    from t5_train import check_resume_compatible
+
+    written = make_config(
+        monkeypatch, OUTPUT_DIR=tmp_path, PER_GPU_BATCH=4, WORLD_SIZE=8, PARALLEL_MODE="ddp"
+    )
+    written.write_json(tmp_path / "run_config.json")
+
+    same = make_config(
+        monkeypatch, OUTPUT_DIR=tmp_path, PER_GPU_BATCH=4, WORLD_SIZE=8, PARALLEL_MODE="ddp"
+    )
+    check_resume_compatible(same, str(tmp_path / "checkpoint-10"))
+
+    fewer = make_config(
+        monkeypatch, OUTPUT_DIR=tmp_path, PER_GPU_BATCH=4, WORLD_SIZE=4, PARALLEL_MODE="ddp"
+    )
+    with pytest.raises(SystemExit):
+        check_resume_compatible(fewer, str(tmp_path / "checkpoint-10"))

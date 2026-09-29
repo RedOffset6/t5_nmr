@@ -1,12 +1,15 @@
 """Fine-tune FLAN-T5 to predict SMILES from NMR spectra.
 
 Configured through environment variables (see config.py and the README).
-Run with plain `python t5_train.py` on one GPU, or under torchrun with
-PARALLEL_MODE=ddp or fsdp on several.
+Run with plain `python t5_train.py` on one GPU. On several GPUs, slurm/train.sbatch
+starts one process per GPU with srun and sets RANK, LOCAL_RANK and WORLD_SIZE;
+PARALLEL_MODE chooses ddp, fsdp or hsdp.
 """
 
 import json
 import os
+import signal
+import sys
 import time
 from pathlib import Path
 
@@ -29,6 +32,8 @@ from nmr_data import load_split, load_tokenized_splits
 class StopBeforeTimeLimit(TrainerCallback):
     """Save a checkpoint and stop cleanly before Slurm kills the job.
 
+    Stops when the deadline (the job's time limit minus a margin) has passed,
+    or when the process receives SIGUSR1 (scancel --signal=USR1 <jobid>).
     Every rank must stop at the same step, or the others would wait forever
     in the next collective, so the ranks agree on the decision with an
     all-reduce. It runs every check_every steps to keep its cost negligible.
@@ -38,14 +43,18 @@ class StopBeforeTimeLimit(TrainerCallback):
         self.deadline = deadline
         self.device = device
         self.check_every = check_every
+        self.signalled = False
         self.stopped = False
+        signal.signal(signal.SIGUSR1, self.on_signal)
+
+    def on_signal(self, signum, frame):
+        self.signalled = True
 
     def on_step_end(self, args, state, control, **kwargs):
         if state.global_step % self.check_every:
             return
-        stop = torch.tensor(
-            [float(time.time() >= self.deadline)], device=self.device
-        )
+        due = self.signalled or (self.deadline > 0 and time.time() >= self.deadline)
+        stop = torch.tensor([float(due)], device=self.device)
         if torch.distributed.is_available() and torch.distributed.is_initialized():
             torch.distributed.all_reduce(stop, op=torch.distributed.ReduceOp.MAX)
         if stop.item():
@@ -67,6 +76,35 @@ def save_metrics_file(output_dir: Path, split: str, metrics: dict) -> None:
     all_metrics.update(metrics)
     with all_results_path.open("w") as file:
         json.dump(all_metrics, file, indent=4, sort_keys=True)
+
+
+# Settings a checkpoint depends on: resuming with different values would
+# either fail to load sharded state or silently change the recipe mid-run.
+RESUME_KEYS = ("world_size", "parallel_mode", "global_batch_size", "effective_learning_rate")
+
+
+def check_resume_compatible(config: TrainConfig, checkpoint: str | None) -> None:
+    """Refuse to resume a checkpoint written with a different layout or recipe."""
+    previous_path = config.output_dir / "run_config.json"
+    if not checkpoint or not previous_path.is_file():
+        return
+    previous = json.loads(previous_path.read_text())
+    current = config.to_dict()
+    mismatches = [
+        f"  {key}: checkpoint {previous[key]}, now {current[key]}"
+        for key in RESUME_KEYS
+        if key in previous and previous[key] != current[key]
+    ]
+    if mismatches:
+        if config.is_main_process:
+            print(
+                f"Cannot resume {checkpoint}: it was written with different settings.\n"
+                + "\n".join(mismatches)
+                + "\nSubmit with the original number of nodes and GPUs, or use a "
+                "new run name to start again.",
+                file=sys.stderr,
+            )
+        sys.exit(1)
 
 
 def final_model_is_complete(final_model_dir: Path) -> bool:
@@ -93,6 +131,8 @@ def build_training_args(config: TrainConfig, use_bf16: bool) -> Seq2SeqTrainingA
     if config.parallel_mode == "ddp":
         # T5 uses every parameter in each step, so DDP can skip the search.
         parallel_args["ddp_find_unused_parameters"] = False
+        # Fewer, larger gradient all-reduces; matters most between nodes.
+        parallel_args["ddp_bucket_cap_mb"] = 200
 
     if config.parallel_mode == "fsdp":
         # Keys as read by transformers 5.12 (TrainingArguments._process_fsdp_args).
@@ -110,6 +150,22 @@ def build_training_args(config: TrainConfig, use_bf16: bool) -> Seq2SeqTrainingA
             "state_dict_type": "SHARDED_STATE_DICT",
         }
 
+    if config.parallel_mode == "hsdp":
+        # Hybrid sharding: the model is sharded over the GPUs of each node
+        # (NVLink) and replicated across nodes, so only a gradient all-reduce
+        # crosses the network. transformers 5.12 offers it through FSDP1.
+        parallel_args["fsdp"] = True
+        parallel_args["fsdp_config"] = {
+            "version": 1,
+            "reshard_after_forward": "hybrid_shard",
+            "auto_wrap_policy": "TRANSFORMER_BASED_WRAP",
+            "transformer_layer_cls_to_wrap": ["T5Block"],
+            "cpu_ram_efficient_loading": True,
+            "sync_module_states": True,
+            "use_orig_params": True,
+            "state_dict_type": "SHARDED_STATE_DICT",
+        }
+
     if config.group_by_length:
         parallel_args["train_sampling_strategy"] = "group_by_length"
 
@@ -121,7 +177,9 @@ def build_training_args(config: TrainConfig, use_bf16: bool) -> Seq2SeqTrainingA
         save_total_limit=config.save_total_limit,
         logging_strategy="steps",
         logging_steps=500,
-        learning_rate=config.learning_rate,
+        learning_rate=config.effective_learning_rate,
+        # A value below 1 is a share of the total training steps.
+        warmup_steps=config.warmup_ratio,
         per_device_train_batch_size=config.train_batch_size,
         per_device_eval_batch_size=config.eval_batch_size,
         gradient_accumulation_steps=config.grad_accumulation_steps,
@@ -147,6 +205,10 @@ def build_training_args(config: TrainConfig, use_bf16: bool) -> Seq2SeqTrainingA
 
 
 def main() -> None:
+    # With one Slurm task per GPU, a task may see all of the node's GPUs (then
+    # LOCAL_RANK picks one) or only its own (then it is device 0).
+    if torch.cuda.device_count() == 1:
+        os.environ["LOCAL_RANK"] = "0"
     config = TrainConfig.from_env()
     final_model_dir = config.output_dir / "final_model"
 
@@ -158,6 +220,17 @@ def main() -> None:
         return
 
     config.output_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint = get_last_checkpoint(str(config.output_dir))
+    check_resume_compatible(config, checkpoint)
+
+    if config.parallel_mode == "hsdp" and torch.cuda.device_count() != config.gpus_per_node:
+        # Hybrid sharding groups the GPUs a process can see into one shard
+        # group; seeing only its own GPU would replicate the full model.
+        raise RuntimeError(
+            f"hsdp needs every process to see all {config.gpus_per_node} GPUs of its "
+            f"node, but it sees {torch.cuda.device_count()}"
+        )
+
     use_bf16 = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
     device = torch.device(
         f"cuda:{config.local_rank}" if torch.cuda.is_available() else "cpu"
@@ -194,7 +267,7 @@ def main() -> None:
         print("Validation rows used for eval_loss:", len(eval_dataset))
         config.write_json(config.output_dir / "run_config.json")
 
-    if config.parallel_mode == "fsdp":
+    if config.parallel_mode in ("fsdp", "hsdp"):
         # Lets from_pretrained see FSDP before the Trainer creates it, so
         # cpu_ram_efficient_loading applies to this load.
         os.environ["ACCELERATE_USE_FSDP"] = "true"
@@ -209,13 +282,9 @@ def main() -> None:
         pad_to_multiple_of=8,
     )
 
-    callbacks = []
-    stopper = None
-    if config.job_end_time > 0:
-        stopper = StopBeforeTimeLimit(
-            config.job_end_time - 60 * config.stop_margin_minutes, device
-        )
-        callbacks.append(stopper)
+    # Without a Slurm time limit (job_end_time 0) it only reacts to SIGUSR1.
+    deadline = config.job_end_time - 60 * config.stop_margin_minutes
+    stopper = StopBeforeTimeLimit(deadline if config.job_end_time > 0 else 0, device)
 
     trainer = Seq2SeqTrainer(
         model=model,
@@ -224,10 +293,9 @@ def main() -> None:
         eval_dataset=eval_dataset,
         processing_class=tokenizer,
         data_collator=data_collator,
-        callbacks=callbacks,
+        callbacks=[stopper],
     )
 
-    checkpoint = get_last_checkpoint(str(config.output_dir))
     if config.is_main_process:
         if checkpoint:
             print("Resuming from checkpoint:", checkpoint)
@@ -236,7 +304,7 @@ def main() -> None:
 
     train_result = trainer.train(resume_from_checkpoint=checkpoint)
 
-    if stopper is not None and stopper.stopped:
+    if stopper.stopped:
         if config.is_main_process:
             print(
                 "Stopped before the job time limit at step",

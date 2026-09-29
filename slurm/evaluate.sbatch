@@ -18,11 +18,19 @@ EVAL_SPLIT="${EVAL_SPLIT:-test}"
 
 if [ "$EVAL_SPLIT" = validation ]; then split_file=val; else split_file=test; fi
 TOTAL=$(wc -l < "$DATA_DIR/tgt-$split_file.txt")
+# EVAL_MAX_ROWS evaluates only the first rows, e.g. 20000 to compare recipes.
+if [ "${EVAL_MAX_ROWS:-0}" -gt 0 ] && [ "$EVAL_MAX_ROWS" -lt "$TOTAL" ]; then
+  TOTAL="$EVAL_MAX_ROWS"
+fi
 # Chunks are rounded up to a multiple of 1,000, so 4 chunks of the
 # 79,441-molecule test set start at 0, 20000, 40000 and 60000.
 CHUNK_SIZE=$(( (TOTAL + SLURM_ARRAY_TASK_COUNT - 1) / SLURM_ARRAY_TASK_COUNT ))
 CHUNK_SIZE=$(( (CHUNK_SIZE + 999) / 1000 * 1000 ))
 START_INDEX=$((SLURM_ARRAY_TASK_ID * CHUNK_SIZE))
+# The last chunk stops at TOTAL (which EVAL_MAX_ROWS may have lowered).
+if [ $((START_INDEX + CHUNK_SIZE)) -gt "$TOTAL" ]; then
+  CHUNK_SIZE=$((TOTAL - START_INDEX))
+fi
 
 echo "Run: $RUN"
 echo "Model: $OUTPUT_DIR/final_model"
