@@ -85,6 +85,16 @@ def test_record_summary_replaces_row_of_same_run(tmp_path):
     assert lines[1].split("\t")[3] == "0.6"
 
 
+def test_target_length_limits_at_their_boundaries():
+    from check_target_lengths import rows_over_limits
+
+    # Lengths include end-of-sequence: training keeps 128 tokens with it,
+    # generation needs 128 tokens without it.
+    truncated, unfinishable = rows_over_limits([128, 129, 130], 128, 128)
+    assert truncated == [1, 2]
+    assert unfinishable == [2]
+
+
 def test_split_size_read_from_results(tmp_path):
     import argparse
 

@@ -49,6 +49,10 @@ Before the first multi-GPU run, check that all 4 GPUs of a node can communicate 
 
     ./submit.sh test-multi-gpu
 
+Check that no reference SMILES is longer than training (`TARGET_MAX_LENGTH`) or evaluation (`GENERATION_MAX_NEW_TOKENS`) allows, in both datasets (`CHECK_DATA_DIRS` in `slurm/env.sh`). The job runs `scripts/check_target_lengths.py` without a GPU, lists any SMILES over a limit, and fails if it finds one; such SMILES can never be predicted exactly:
+
+    ./submit.sh check-lengths
+
 ### 2. Train a model
 
 Pick a run from `configs/train/` and submit it:
@@ -102,6 +106,8 @@ To test a trained model on just 10 molecules first, run `./submit.sh check <run>
 
 ### 4. Combine the results
 
+`./submit.sh evaluate` also submits a short CPU job, `combine_<run>`, that starts once every chunk has succeeded and runs `scripts/combine_results.py`. Its log is `logs/combine_<run>_<job>.out`. If a chunk fails, Slurm cancels the combine job; submit the evaluation again to resume the chunks and queue a new one. To combine by hand, for example after copying results from another machine:
+
     python scripts/combine_results.py xl_4x4_10ep
 
 This script:
@@ -109,7 +115,7 @@ This script:
 - checks that the chunks cover the whole test set exactly once;
 - prints top-1 to top-N exact match, weighting each chunk by its number of molecules;
 - joins the chunks' predictions into `prd-test.txt` in the output folder;
-- records the top-1 score in `reports/evaluation_summary.tsv` under the run name. Combining a run again replaces its row.
+- records top-1 (`exact_match`) to top-N (`top_2`, `top_3`, …) in `reports/evaluation_summary.tsv` under the run name. Combining a run again replaces its row. The combine job names the row after the output folder when `--nodes`, `--gpus` or `MAX_STEPS` gave the run its own folder, for example `xl_pg4_10ep_gb128`; `--experiment` sets the name by hand.
 
 Each chunk's results record the size of the test set. Results from evaluations made before this was added don't, so for those the script counts the test set in the run's `DATA_DIR`, or in the folder given by `--data-dir`. `--total 79441` skips the count.
 
@@ -281,7 +287,8 @@ This writes to `outputs/xl_pg4_10ep_gb64`: the folder name records the global ba
 Then compare them on the first 20,000 test molecules:
 
     EVAL_MAX_ROWS=20000 ./submit.sh evaluate base_scaling_gb16
-    python scripts/combine_results.py base_scaling_gb16 --total 20000
+
+The combine job passes `--total 20000` itself.
 
 Repeat for the other two runs. Accept a scaled recipe if its top-1 exact match is within about 0.5% of the reference. If neither is, try a global batch of 64. Then set `LR_SCALING` in `xl_pg4_10ep` and `xxl_pg2_10ep` to the recipe that passed.
 
@@ -366,6 +373,7 @@ GitHub Actions runs both on every push (`.github/workflows/smoke.yml`). `python 
     slurm/*.sbatch               Slurm job templates
     scripts/combine_results.py   combines evaluation chunks
     scripts/dataset_stats.py     token-length and tokenizer statistics
+    scripts/check_target_lengths.py  SMILES longer than the token limits
     scripts/scaling_table.py     throughput and scaling efficiency across node counts
     tests/                       unit and smoke tests
     requirements.txt             packages the code uses
