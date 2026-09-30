@@ -5,7 +5,7 @@
 Finds <output dir>/test_<start>_<end>_results.json for the run, checks that
 the chunks cover the whole split exactly once, prints top-1 to top-N exact
 match weighted by chunk size, joins the chunks' predictions into
-prd-test.txt, and records the result in reports/evaluation_summary.tsv.
+prd-test.txt, and records top-1 to top-N in reports/evaluation_summary.tsv.
 """
 
 import argparse
@@ -28,6 +28,8 @@ SUMMARY_COLUMNS = [
     "chunks",
     "total_samples",
     "exact_match",
+    # Top-n exact match for n = 2 to 10, blank for runs with fewer outputs.
+    *(f"top_{n}" for n in range(2, 11)),
     "job_id",
     "date",
 ]
@@ -42,6 +44,10 @@ def parse_args() -> argparse.Namespace:
         help="Folder with the chunk results; defaults to the run's OUTPUT_DIR",
     )
     parser.add_argument("--split", choices=("validation", "test"), default="test")
+    parser.add_argument(
+        "--experiment",
+        help="Name of the row in the summary; defaults to the run name",
+    )
     parser.add_argument(
         "--data-dir",
         type=Path,
@@ -163,9 +169,13 @@ def record_summary(summary: Path, row: dict) -> None:
     # Evaluating a run again replaces its row.
     rows = [existing for existing in rows if existing["experiment"] != row["experiment"]]
     rows.append(row)
+    # Runs with more than 10 outputs add top_11 and beyond at the end.
+    columns = list(SUMMARY_COLUMNS)
+    for existing in rows:
+        columns += [name for name in existing if name not in columns]
     with summary.open("w", newline="") as file:
         writer = csv.DictWriter(
-            file, fieldnames=SUMMARY_COLUMNS, delimiter="\t", restval="",
+            file, fieldnames=columns, delimiter="\t", restval="",
             lineterminator="\n",
         )
         writer.writeheader()
@@ -201,10 +211,14 @@ def main() -> None:
         record_summary(
             args.summary,
             {
-                "experiment": args.run,
+                "experiment": args.experiment or args.run,
                 "chunks": len(chunks),
                 "total_samples": total,
                 "exact_match": f"{top_n[0] / total:.8f}",
+                **{
+                    f"top_{rank}": f"{matches / total:.8f}"
+                    for rank, matches in enumerate(top_n[1:], start=2)
+                },
                 "job_id": ",".join(job_ids),
                 "date": datetime.date.today().isoformat(),
             },

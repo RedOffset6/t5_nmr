@@ -4,11 +4,13 @@
 #   ./submit.sh train <run> [--nodes N] [--gpus N] [sbatch options]
 #                                                 train (resubmits itself until done)
 #   ./submit.sh evaluate <run> [--nodes N] [--gpus N] [sbatch options]
-#                                                 full test-set evaluation (array job)
+#                                                 full test-set evaluation (array job),
+#                                                 then combine_results.py once it succeeds
 #   ./submit.sh check <run> [--nodes N] [--gpus N] [sbatch options]
 #                                                 evaluate 10 molecules
 #   ./submit.sh test-gpu [sbatch options]         GPU and PyTorch check
 #   ./submit.sh test-multi-gpu [sbatch options]   NCCL check on 4 GPUs (--nodes=2 for two nodes)
+#   ./submit.sh check-lengths [sbatch options]    SMILES longer than the token limits (no GPU)
 #
 # --nodes and --gpus (GPUs per node) override the run's config; the run's
 # output folder then records the global batch, outputs/<run>_gb<N>, and
@@ -24,7 +26,7 @@ source slurm/env.sh
 mkdir -p logs
 
 usage() {
-  sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//' >&2
+  sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//' >&2
   exit 1
 }
 
@@ -38,6 +40,9 @@ case "$job" in
     ;;
   test-multi-gpu)
     exec sbatch "$@" slurm/test_multi_gpu.sbatch
+    ;;
+  check-lengths)
+    exec sbatch "$@" slurm/check_target_lengths.sbatch
     ;;
   train|evaluate|check)
     [ $# -ge 1 ] || usage
@@ -88,7 +93,7 @@ case "$job" in
     ;;
   evaluate)
     chunks="${EVAL_CHUNKS:-4}"
-    exec sbatch \
+    eval_job=$(sbatch --parsable \
       --job-name="eval_$RUN" \
       --array="0-$((chunks - 1))" \
       --nodes=1 \
@@ -98,7 +103,23 @@ case "$job" in
       --mem="${EVAL_MEM:-64G}" \
       --time="${EVAL_TIME:-10:00:00}" \
       --export=ALL \
-      "$@" slurm/evaluate.sbatch
+      "$@" slurm/evaluate.sbatch)
+    eval_job="${eval_job%%;*}"
+    echo "Submitted evaluation array job $eval_job"
+    # Combines the chunks once all of them succeed. If a chunk fails, Slurm
+    # cancels this job; submitting the evaluation again resumes the chunks
+    # and submits a new one.
+    sbatch \
+      --job-name="combine_$RUN" \
+      --dependency="afterok:$eval_job" \
+      --kill-on-invalid-dep=yes \
+      --nodes=1 \
+      --ntasks-per-node=1 \
+      --cpus-per-task=4 \
+      --mem=16G \
+      --time=00:30:00 \
+      --export=ALL \
+      slurm/combine.sbatch
     ;;
   check)
     exec sbatch \
