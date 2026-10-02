@@ -1,21 +1,15 @@
 .venv/
-.venv-1/
 __pycache__/
 *.py[cod]
+.pytest_cache/
 .DS_Store
 
 logs/
 slurm-*.out
 tmp/
-.codex_work/
 
 outputs/
-checkpoints/
-wandb/
-
-Miniforge3-Linux-aarch64.sh
+results/
 
 alberts_2d/
 nmr_expt_data/
-results/
-results-flan-t5-large/

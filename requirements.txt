@@ -1,0 +1,12 @@
+# Packages the code imports, pinned to the versions the results were produced
+# with. environment.lock.txt has the full frozen list for the cluster.
+--extra-index-url https://download.pytorch.org/whl/cu126
+torch==2.12.1
+transformers==5.12.1
+accelerate==1.14.0
+datasets==5.0.0
+tokenizers==0.22.2
+sentencepiece==0.2.1
+safetensors==0.8.0
+numpy==2.4.6
+tqdm==4.68.3
